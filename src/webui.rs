@@ -3,6 +3,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use serde_json::Value as JsonValue;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{debug, info};
@@ -94,7 +95,7 @@ fn http_response(status: u16, ct: &str, body: &[u8]) -> Vec<u8> {
         _ => "Error",
     };
     let header = format!(
-        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {status_text}\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut out = header.into_bytes();
@@ -130,8 +131,12 @@ fn api_databases(db: &Engine) -> String {
 
 fn api_query(db: &Engine, body: &str) -> String {
     // Parse JSON body: {"db": "mydb", "sql": "SELECT 1"}
-    let db_name = extract_json_str(body, "db");
-    let sql = extract_json_str(body, "sql");
+    let parsed: JsonValue = match serde_json::from_str(body) {
+        Ok(v) => v,
+        Err(_) => return r#"{"error":"Invalid JSON"}"#.to_owned(),
+    };
+    let db_name = parsed["db"].as_str().unwrap_or("").to_owned();
+    let sql = parsed["sql"].as_str().unwrap_or("").to_owned();
 
     if sql.is_empty() {
         return r#"{"error":"Missing sql field"}"#.to_owned();
@@ -163,25 +168,3 @@ fn api_query(db: &Engine, body: &str) -> String {
     }
 }
 
-/// Very simple JSON string field extractor — no external dep.
-fn extract_json_str(json: &str, key: &str) -> String {
-    let needle = format!("\"{}\"", key);
-    let pos = match json.find(&needle) {
-        Some(p) => p + needle.len(),
-        None => return String::new(),
-    };
-    let rest = json[pos..].trim_start();
-    if !rest.starts_with(':') { return String::new(); }
-    let rest = rest[1..].trim_start();
-    if rest.starts_with('"') {
-        let inner = &rest[1..];
-        let end = inner.find('"').unwrap_or(inner.len());
-        inner[..end].to_owned()
-    } else if rest.starts_with("null") {
-        String::new()
-    } else {
-        // Non-string value
-        let end = rest.find([',', '}', ']']).unwrap_or(rest.len());
-        rest[..end].trim().to_owned()
-    }
-}
