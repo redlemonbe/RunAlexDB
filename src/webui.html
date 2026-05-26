@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RunAlexDB Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117;--surface:#161b22;--surface2:#21262d;--border:#30363d;
+  --text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--green:#3fb950;
+  --red:#f85149;--yellow:#d29922;--purple:#bc8cff;
+}
+body{background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,sans-serif;display:flex;height:100vh}
+#sidebar{width:220px;background:var(--surface);border-right:1px solid var(--border);display:flex;flex-direction:column;padding:0}
+.logo{padding:20px 16px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.logo-icon{width:32px;height:32px;background:linear-gradient(135deg,#58a6ff,#bc8cff);border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:14px;color:#000}
+.logo-text{font-weight:700;font-size:15px}
+.logo-ver{font-size:11px;color:var(--muted)}
+nav{flex:1;padding:8px 0}
+.nav-section{padding:8px 16px 4px;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
+.nav-item{display:flex;align-items:center;gap:10px;padding:8px 16px;cursor:pointer;border-radius:0;transition:background .15s;color:var(--muted);font-size:13px}
+.nav-item:hover{background:var(--surface2);color:var(--text)}
+.nav-item.active{background:var(--surface2);color:var(--accent);font-weight:600}
+.nav-icon{font-size:16px;width:20px;text-align:center}
+#main{flex:1;display:flex;flex-direction:column;overflow:hidden}
+#topbar{height:52px;border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 24px;gap:12px;background:var(--surface)}
+.tab{display:none}
+.tab.active{display:flex;flex-direction:column;flex:1;overflow:hidden}
+.tab-body{padding:24px;overflow-y:auto;flex:1}
+h2{font-size:18px;font-weight:700;margin-bottom:16px}
+.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:16px;border-top:3px solid var(--accent)}
+.card-label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.card-value{font-size:28px;font-weight:700;margin-top:4px}
+.card.green{border-top-color:var(--green)}
+.card.purple{border-top-color:var(--purple)}
+.card.yellow{border-top-color:var(--yellow)}
+table{width:100%;border-collapse:collapse;background:var(--surface);border-radius:8px;overflow:hidden;border:1px solid var(--border)}
+th{text-align:left;padding:10px 14px;background:var(--surface2);font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;border-bottom:1px solid var(--border)}
+td{padding:10px 14px;border-bottom:1px solid var(--border);font-size:13px}
+tr:last-child td{border-bottom:none}
+tr:hover td{background:var(--surface2)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:6px;border:none;cursor:pointer;font-size:13px;font-weight:600;transition:opacity .15s}
+.btn-primary{background:var(--accent);color:#000}
+.btn-primary:hover{opacity:.85}
+.btn-danger{background:var(--red);color:#fff}
+.btn-danger:hover{opacity:.85}
+.btn-sm{padding:4px 10px;font-size:12px}
+.toolbar{display:flex;align-items:center;gap:10px;margin-bottom:16px}
+input,select,textarea{background:var(--surface2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 12px;font-size:13px;outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:var(--accent)}
+.query-area{width:100%;height:120px;font-family:monospace;font-size:13px;resize:vertical}
+.result-box{margin-top:16px;background:var(--surface);border:1px solid var(--border);border-radius:8px;overflow:auto;max-height:400px}
+.status-ok{color:var(--green)}
+.status-err{color:var(--red)}
+.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600}
+.badge-green{background:#1a4731;color:var(--green)}
+.badge-blue{background:#102b4e;color:var(--accent)}
+#login-screen{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:100}
+.login-card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:360px}
+.login-card h1{font-size:22px;margin-bottom:8px}
+.login-card p{color:var(--muted);margin-bottom:24px;font-size:13px}
+.form-row{margin-bottom:16px}
+.form-row label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.form-row input{width:100%}
+.login-err{color:var(--red);font-size:12px;margin-top:8px;display:none}
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="login-card">
+    <h1>RunAlexDB</h1>
+    <p>Admin console — enter your API key to continue.</p>
+    <div class="form-row">
+      <label>API Key</label>
+      <input type="password" id="api-key-input" placeholder="Enter admin API key">
+    </div>
+    <button class="btn btn-primary" style="width:100%" onclick="doLogin()">Sign in</button>
+    <p class="login-err" id="login-err">Invalid API key</p>
+  </div>
+</div>
+
+<div id="sidebar">
+  <div class="logo">
+    <div class="logo-icon">R</div>
+    <div>
+      <div class="logo-text">RunAlexDB</div>
+      <div class="logo-ver" id="ver-label">v0.1.0</div>
+    </div>
+  </div>
+  <nav>
+    <div class="nav-section">Database</div>
+    <div class="nav-item active" onclick="showTab('dashboard')" id="nav-dashboard"><span class="nav-icon">◈</span>Dashboard</div>
+    <div class="nav-item" onclick="showTab('query')" id="nav-query"><span class="nav-icon">⌨</span>SQL Console</div>
+    <div class="nav-item" onclick="showTab('databases')" id="nav-databases"><span class="nav-icon">◫</span>Databases</div>
+    <div class="nav-item" onclick="showTab('tables')" id="nav-tables"><span class="nav-icon">⊞</span>Tables</div>
+    <div class="nav-section">Administration</div>
+    <div class="nav-item" onclick="showTab('users')" id="nav-users"><span class="nav-icon">◉</span>Users</div>
+    <div class="nav-item" onclick="showTab('settings')" id="nav-settings"><span class="nav-icon">⚙</span>Settings</div>
+  </nav>
+</div>
+
+<div id="main">
+  <div id="topbar">
+    <span style="color:var(--muted);font-size:13px">RunAlexDB Admin Console</span>
+    <span style="margin-left:auto;font-size:12px;color:var(--muted)" id="conn-status">● Connected</span>
+  </div>
+
+  <!-- Dashboard -->
+  <div id="tab-dashboard" class="tab active">
+    <div class="tab-body">
+      <h2>Dashboard</h2>
+      <div class="card-grid">
+        <div class="card"><div class="card-label">Databases</div><div class="card-value" id="stat-dbs">—</div></div>
+        <div class="card green"><div class="card-label">Tables</div><div class="card-value" id="stat-tables">—</div></div>
+        <div class="card purple"><div class="card-label">Version</div><div class="card-value" id="stat-ver" style="font-size:16px">—</div></div>
+        <div class="card yellow"><div class="card-label">Protocol</div><div class="card-value" style="font-size:16px">MySQL 8</div></div>
+      </div>
+      <div id="db-list-card"></div>
+    </div>
+  </div>
+
+  <!-- SQL Console -->
+  <div id="tab-query" class="tab">
+    <div class="tab-body">
+      <h2>SQL Console</h2>
+      <div class="toolbar">
+        <select id="query-db" style="width:180px"></select>
+        <button class="btn btn-primary" onclick="runQuery()">▶ Execute</button>
+        <button class="btn" style="background:var(--surface2)" onclick="clearQuery()">Clear</button>
+      </div>
+      <textarea class="query-area" id="query-input" placeholder="-- Write SQL here
+SELECT * FROM my_table;
+CREATE TABLE users (id INT, name VARCHAR(100));
+INSERT INTO users VALUES (1, 'Alice');"></textarea>
+      <div class="result-box" id="query-result" style="padding:14px;font-size:13px;color:var(--muted)">Results will appear here.</div>
+    </div>
+  </div>
+
+  <!-- Databases -->
+  <div id="tab-databases" class="tab">
+    <div class="tab-body">
+      <h2>Databases</h2>
+      <div class="toolbar">
+        <input type="text" id="new-db-name" placeholder="new_database">
+        <button class="btn btn-primary" onclick="createDb()">+ Create</button>
+      </div>
+      <div id="db-table"></div>
+    </div>
+  </div>
+
+  <!-- Tables -->
+  <div id="tab-tables" class="tab">
+    <div class="tab-body">
+      <h2>Tables</h2>
+      <div class="toolbar">
+        <select id="tables-db" style="width:180px" onchange="loadTables()"></select>
+      </div>
+      <div id="tables-list"></div>
+    </div>
+  </div>
+
+  <!-- Users -->
+  <div id="tab-users" class="tab">
+    <div class="tab-body">
+      <h2>Database Users</h2>
+      <div class="toolbar">
+        <input type="text" id="new-user" placeholder="username">
+        <input type="password" id="new-pass" placeholder="password">
+        <button class="btn btn-primary" onclick="createUser()">+ Add User</button>
+      </div>
+      <div id="users-table"></div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div id="tab-settings" class="tab">
+    <div class="tab-body">
+      <h2>Settings</h2>
+      <table style="max-width:600px">
+        <tr><th>Parameter</th><th>Value</th></tr>
+        <tr><td>MySQL Port</td><td id="cfg-mysql-port">3306</td></tr>
+        <tr><td>Admin UI Port</td><td id="cfg-ui-port">8306</td></tr>
+        <tr><td>Version</td><td id="cfg-ver">—</td></tr>
+        <tr><td>Protocol</td><td>MySQL 8.0 (wire compatible)</td></tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const CFG_KEY='{{API_KEY}}';
+let apiKey = localStorage.getItem('runalexdb_key') || '';
+
+function showTab(name) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  document.getElementById('tab-'+name).classList.add('active');
+  document.getElementById('nav-'+name).classList.add('active');
+  if (name === 'databases' || name === 'tables' || name === 'query') loadDatabases();
+  if (name === 'tables') loadTables();
+}
+
+function doLogin() {
+  const k = document.getElementById('api-key-input').value.trim();
+  if (k === CFG_KEY || CFG_KEY === 'changeme') {
+    apiKey = k || CFG_KEY;
+    localStorage.setItem('runalexdb_key', apiKey);
+    document.getElementById('login-screen').style.display = 'none';
+    loadDashboard();
+  } else {
+    document.getElementById('login-err').style.display = 'block';
+  }
+}
+
+async function api(path) {
+  const r = await fetch('/api'+path, {headers:{'X-API-Key': apiKey}});
+  return r.json();
+}
+
+async function apiPost(path, body) {
+  const r = await fetch('/api'+path, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json','X-API-Key': apiKey},
+    body: JSON.stringify(body)
+  });
+  return r.json();
+}
+
+async function loadDashboard() {
+  const sys = await api('/system');
+  document.getElementById('stat-dbs').textContent = sys.databases ?? '—';
+  document.getElementById('stat-tables').textContent = sys.tables ?? '—';
+  document.getElementById('stat-ver').textContent = sys.version ?? '—';
+  document.getElementById('ver-label').textContent = 'v'+(sys.version||'?');
+  document.getElementById('cfg-ver').textContent = sys.version || '—';
+  loadDatabasesList();
+}
+
+async function loadDatabasesList() {
+  const dbs = await api('/databases');
+  if (!Array.isArray(dbs)) return;
+  const el = document.getElementById('db-list-card');
+  if (!dbs.length) { el.innerHTML = '<p style="color:var(--muted)">No user databases yet.</p>'; return; }
+  el.innerHTML = '<table><tr><th>Database</th><th>Tables</th><th></th></tr>' +
+    dbs.map(d => `<tr><td>${d}</td><td>—</td><td><button class="btn btn-sm" style="background:var(--surface2)" onclick="useDb('${d}')">Browse</button></td></tr>`).join('') +
+    '</table>';
+}
+
+async function loadDatabases() {
+  const dbs = await api('/databases');
+  if (!Array.isArray(dbs)) return;
+  const opts = dbs.map(d => `<option value="${d}">${d}</option>`).join('');
+  ['query-db','tables-db'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = opts;
+  });
+  const el = document.getElementById('db-table');
+  if (el) el.innerHTML = '<table><tr><th>Name</th><th></th></tr>' +
+    dbs.map(d => `<tr><td>${d}</td><td><button class="btn btn-sm btn-danger" onclick="dropDb('${d}')">Drop</button></td></tr>`).join('') +
+    '</table>';
+}
+
+async function createDb() {
+  const name = document.getElementById('new-db-name').value.trim();
+  if (!name) return;
+  await apiPost('/query', {db: null, sql: `CREATE DATABASE \`${name}\``});
+  document.getElementById('new-db-name').value = '';
+  loadDashboard();
+  loadDatabases();
+}
+
+async function dropDb(name) {
+  if (!confirm(`Drop database '${name}'? This cannot be undone.`)) return;
+  await apiPost('/query', {db: null, sql: `DROP DATABASE \`${name}\``});
+  loadDashboard();
+  loadDatabases();
+}
+
+async function loadTables() {
+  const db = document.getElementById('tables-db')?.value;
+  if (!db) return;
+  const res = await apiPost('/query', {db, sql: 'SHOW TABLES'});
+  const el = document.getElementById('tables-list');
+  if (!el) return;
+  if (!res.rows || !res.rows.length) {
+    el.innerHTML = '<p style="color:var(--muted)">No tables in this database.</p>';
+    return;
+  }
+  el.innerHTML = '<table><tr><th>Table</th><th></th></tr>' +
+    res.rows.map(r => `<tr><td>${r[0]??''}</td><td><button class="btn btn-sm" style="background:var(--surface2)" onclick="browseTable('${db}','${r[0]}')">Browse</button></td></tr>`).join('') +
+    '</table>';
+}
+
+async function runQuery() {
+  const sql = document.getElementById('query-input').value.trim();
+  const db = document.getElementById('query-db')?.value;
+  if (!sql) return;
+  const res = await apiPost('/query', {db, sql});
+  const el = document.getElementById('query-result');
+  if (res.error) {
+    el.innerHTML = `<span class="status-err">Error ${res.code}: ${res.message}</span>`;
+  } else if (res.rows) {
+    const cols = res.columns || [];
+    el.innerHTML = '<table>' +
+      '<tr>' + cols.map(c=>`<th>${c}</th>`).join('') + '</tr>' +
+      res.rows.map(r=>'<tr>'+r.map(v=>`<td>${v??'<i style="color:var(--muted)">NULL</i>'}</td>`).join('')+'</tr>').join('') +
+      '</table>';
+  } else {
+    el.innerHTML = `<span class="status-ok">OK — ${res.affected??0} row(s) affected</span>`;
+  }
+}
+
+function clearQuery() { document.getElementById('query-input').value = ''; }
+
+function useDb(name) {
+  showTab('query');
+  const sel = document.getElementById('query-db');
+  if (sel) sel.value = name;
+}
+
+async function browseTable(db, table) {
+  showTab('query');
+  const sel = document.getElementById('query-db');
+  if (sel) sel.value = db;
+  document.getElementById('query-input').value = `SELECT * FROM \`${table}\` LIMIT 100;`;
+  await runQuery();
+}
+
+function createUser() { alert('User management — coming in v0.2'); }
+
+// Auto-login if key matches embedded config
+if (apiKey && (apiKey === CFG_KEY || CFG_KEY === 'changeme')) {
+  document.getElementById('login-screen').style.display = 'none';
+  loadDashboard();
+} else if (!apiKey) {
+  document.getElementById('api-key-input').focus();
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,61 @@
+[package]
+name        = "runalexdb"
+version     = "0.1.0"
+edition     = "2021"
+description = "High-performance SQL database — MySQL/MariaDB wire protocol, XDP fast-path, SIMD query engine"
+license     = "AGPL-3.0-only"
+authors     = ["RedLemonBe <redlemonbe@codix.be>"]
+repository  = "https://github.com/redlemonbe/RunAlexDB"
+
+[[bin]]
+name = "runalexdb"
+path = "src/main.rs"
+
+[features]
+default = ["tls"]
+tls     = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:rcgen"]
+xdp     = []
+
+[dependencies]
+# Async runtime
+tokio        = { version = "1", features = ["full"] }
+tokio-util   = { version = "0.7", features = ["codec"] }
+
+# MySQL wire protocol
+bytes        = "1"
+
+# SQL parsing (MySQL dialect)
+sqlparser     = { version = "0.55", features = [] }
+
+# Serialization
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+
+# TLS (optional)
+rustls       = { version = "0.23", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rcgen        = { version = "0.13", optional = true }
+
+# Error handling
+anyhow       = "1"
+thiserror    = "2"
+
+# Logging
+tracing             = "0.1"
+tracing-subscriber  = { version = "0.3", features = ["env-filter"] }
+
+# Config
+toml         = "0.8"
+
+# Crypto (auth hashing — MySQL native_password / caching_sha2)
+sha2         = "0.10"
+sha1         = "0.10"
+rand         = "0.8"
+hex          = "0.4"
+
+[profile.release]
+opt-level   = 3
+lto         = "fat"
+codegen-units = 1
+strip       = true
