@@ -99,7 +99,7 @@ impl Engine {
     pub fn new(_cfg: &Config) -> Self {
         let mut dbs = HashMap::new();
         // Built-in schemas
-        for name in &["information_schema", "performance_schema", "mysql", "sys"] {
+        for name in &["information_schema", "performance_schema", "mysql", "sys", "test"] {
             dbs.insert(name.to_string(), Arc::new(RwLock::new(Database {
                 name: name.to_string(),
                 tables: HashMap::new(),
@@ -199,9 +199,14 @@ impl Engine {
         name: ObjectName,
         col_defs: Vec<ColumnDef>,
     ) -> QueryResult {
-        let table_name = name.0.last()
+        let parts: Vec<String> = name.0.iter()
             .map(|p| p.as_ident().map(|i| i.value.clone()).unwrap_or_default())
-            .unwrap_or_default();
+            .collect();
+        let (db_name, table_name) = if parts.len() >= 2 {
+            (parts[parts.len()-2].clone(), parts[parts.len()-1].clone())
+        } else {
+            (db_name.to_owned(), parts.last().cloned().unwrap_or_default())
+        };
 
         let columns: Vec<Column> = col_defs.iter().map(|c| {
             let col_type = sql_type_to_col_type(&c.data_type);
@@ -214,7 +219,7 @@ impl Engine {
         }).collect();
 
         let dbs = self.databases.read().unwrap();
-        if let Some(db_arc) = dbs.get(db_name) {
+        if let Some(db_arc) = dbs.get(&db_name) {
             let mut db = db_arc.write().unwrap();
             db.tables.insert(table_name.clone(), Table {
                 name: table_name,
@@ -242,12 +247,20 @@ impl Engine {
             return QueryResult::err(1064, "Only VALUES inserts supported");
         };
 
+        // Handle db.table qualified names
+        let (eff_db, eff_table) = if let Some(dot) = table_name.find('.') {
+            (table_name[..dot].trim_matches('`').to_owned(), table_name[dot+1..].trim_matches('`').to_owned())
+        } else {
+            (db_name.to_owned(), table_name.to_owned())
+        };
+        let db_name = &eff_db;
+        let table_name = &eff_table;
         let dbs = self.databases.read().unwrap();
-        let Some(db_arc) = dbs.get(db_name) else {
+        let Some(db_arc) = dbs.get(db_name.as_str()) else {
             return QueryResult::err(1049, &format!("Unknown database '{db_name}'"));
         };
         let mut db = db_arc.write().unwrap();
-        let Some(table) = db.tables.get_mut(table_name) else {
+        let Some(table) = db.tables.get_mut(table_name.as_str()) else {
             return QueryResult::err(1146, &format!("Table '{db_name}.{table_name}' doesn't exist"));
         };
 
@@ -282,9 +295,15 @@ impl Engine {
             return QueryResult::rows(cols, vec![vals]);
         }
 
-        let table_name = sel.from[0].relation.to_string();
+        let raw_table = sel.from[0].relation.to_string();
+        let (sel_db, table_name) = if let Some(dot) = raw_table.find('.') {
+            (raw_table[..dot].trim_matches('`').to_owned(), raw_table[dot+1..].trim_matches('`').to_owned())
+        } else {
+            (db_name.to_owned(), raw_table.trim_matches('`').to_owned())
+        };
+        let db_name = sel_db;
         let dbs = self.databases.read().unwrap();
-        let Some(db_arc) = dbs.get(db_name) else {
+        let Some(db_arc) = dbs.get(&db_name) else {
             return QueryResult::err(1049, &format!("Unknown database '{db_name}'"));
         };
         let db = db_arc.read().unwrap();
