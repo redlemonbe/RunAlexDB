@@ -214,6 +214,7 @@ where
     let mut current_db: Option<String> = None;
     let mut stmt_cache: std::collections::HashMap<u32, PreparedStmt> = std::collections::HashMap::new();
     let mut next_stmt_id: u32 = 1;
+    let mut effective_user = String::from("root");
     loop {
         // If buf already has data (pre-read before calling us), skip the network read.
         if buf.is_empty() {
@@ -236,7 +237,7 @@ where
             };
             // Multi-user auth: check username against user table
             let username_str = _username.trim_matches(' ').to_owned();
-            let effective_user = if username_str.is_empty() { "root".to_owned() } else { username_str.clone() };
+            effective_user = if username_str.is_empty() { "root".to_owned() } else { username_str.clone() };
             let auth_ok = {
                 // Try user table first
                 if let Some((stored_hash2, _is_root)) = db.lookup_user(&effective_user) {
@@ -339,7 +340,7 @@ where
                             continue;
                         }
                     }
-                    let result = db.execute(&sql, &current_db);
+                    let result = db.execute(&sql, &current_db, &effective_user);
                     write_buf.clear();
                     protocol::build_result_into(&mut write_buf, &result, 1);
                     stream.write_all(&write_buf).await?;
@@ -377,7 +378,7 @@ where
                         }
                     };
                     let params = parse_execute_params(&payload, stmt.num_params);
-                    let result = db.execute_prepared(&stmt.sql, &params, &current_db);
+                    let result = db.execute_prepared(&stmt.sql, &params, &current_db, &effective_user);
                     write_buf.clear();
                     protocol::build_binary_result_into(&mut write_buf, &result, 1);
                     stream.write_all(&write_buf).await?;

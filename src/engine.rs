@@ -193,7 +193,7 @@ impl Engine {
     }
 
     /// Execute a SQL statement string in the context of `current_db`.
-    pub fn execute(&self, sql: &str, current_db: &Option<String>) -> QueryResult {
+    pub fn execute(&self, sql: &str, current_db: &Option<String>, user_name: &str) -> QueryResult {
         // Handle built-in special queries first
         let sql_upper = sql.trim().to_uppercase();
         if sql_upper == "SELECT 1" || sql_upper == "SELECT 1;" {
@@ -368,6 +368,32 @@ impl Engine {
             Ok(s) => s,
             Err(e) => return QueryResult::err(1064, &e),
         };
+        // ── Privilege check ──────────────────────────────────────────────────
+        {
+            let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(user) = users.get(user_name) {
+                if let (Some(ref allowed), Some(ref db)) = (&user.allowed_dbs, current_db) {
+                    if !allowed.contains(db) {
+                        return QueryResult::err(1044, &format!(
+                            "Access denied for user '{}' to database '{}'", user_name, db
+                        ));
+                    }
+                }
+                if !user.can_write {
+                    let needs_write = stmts.iter().any(|s| matches!(s,
+                        Statement::Insert(_)
+                        | Statement::Update { .. }
+                        | Statement::Delete(_)
+                        | Statement::CreateTable(_)
+                        | Statement::CreateDatabase { .. }
+                        | Statement::Drop { .. }
+                    ));
+                    if needs_write {
+                        return QueryResult::err(1142, "Command denied to user (no write privilege)");
+                    }
+                }
+            }
+        }
         let mut last = QueryResult::ok(0, 0);
         for stmt in stmts.iter() {
             last = self.exec_stmt(stmt.clone(), current_db);
@@ -974,7 +1000,7 @@ impl Engine {
                     current_db = Some(db_name);
                     continue;
                 }
-                let _ = self.execute(&stmt, &current_db);
+                let _ = self.execute(&stmt, &current_db, "root");
             }
         }
     }
@@ -1505,7 +1531,7 @@ fn parse_user_ident_with_password(s: &str) -> (String, String) {
 impl Engine {
     /// Execute a prepared statement SQL (with ? placeholders) using bound parameters.
     /// The SQL with ? is used as the cache key — parse happens only once per statement.
-    pub fn execute_prepared(&self, sql: &str, params: &[Option<String>], current_db: &Option<String>) -> QueryResult {
+    pub fn execute_prepared(&self, sql: &str, params: &[Option<String>], current_db: &Option<String>, user_name: &str) -> QueryResult {
         let bound: Vec<Value> = params.iter().map(|p| match p {
             None => Value::Null,
             Some(s) => match s.parse::<i64>() {
@@ -1521,6 +1547,32 @@ impl Engine {
             Ok(s) => s,
             Err(e) => return QueryResult::err(1064, &e),
         };
+        // ── Privilege check ──────────────────────────────────────────────────
+        {
+            let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(user) = users.get(user_name) {
+                if let (Some(ref allowed), Some(ref db)) = (&user.allowed_dbs, current_db) {
+                    if !allowed.contains(db) {
+                        return QueryResult::err(1044, &format!(
+                            "Access denied for user '{}' to database '{}'", user_name, db
+                        ));
+                    }
+                }
+                if !user.can_write {
+                    let needs_write = stmts.iter().any(|s| matches!(s,
+                        Statement::Insert(_)
+                        | Statement::Update { .. }
+                        | Statement::Delete(_)
+                        | Statement::CreateTable(_)
+                        | Statement::CreateDatabase { .. }
+                        | Statement::Drop { .. }
+                    ));
+                    if needs_write {
+                        return QueryResult::err(1142, "Command denied to user (no write privilege)");
+                    }
+                }
+            }
+        }
         let mut last = QueryResult::ok(0, 0);
         for stmt in stmts.iter() {
             last = self.exec_stmt_prepared(stmt.clone(), &bound, current_db);
@@ -1596,7 +1648,7 @@ impl Engine {
         // PK fast path: WHERE pk = ? (O(1) lookup)
         if let (Some(pk_idx), Some(ref where_expr)) = (table.pk_col_idx, &sel.selection) {
             let pk_col_name = &table.columns[pk_idx].name.clone();
-            if let Some(param_pos) = extract_pk_eq_param(pk_col_name, where_expr) {
+            if let Some(param_pos) = extract_pk_eq_param(pk_col_name, where_expr, 0) {
                 if let Some(pk_val) = bound.get(param_pos).map(|v| value_to_pk_str(v)) {
                     let result_rows: Vec<Vec<Option<String>>> =
                         if let Some(&ri) = table.pk_index.get(&pk_val) {
@@ -1699,7 +1751,10 @@ impl Engine {
         // PK fast path for UPDATE WHERE pk = ?
         if let (Some(pk_idx), Some(w)) = (table.pk_col_idx, selection) {
             let pk_col_name = table.columns[pk_idx].name.clone();
-            if let Some(param_pos) = extract_pk_eq_param(&pk_col_name, w) {
+            let asgn_param_count = assignments.iter()
+                .filter(|a| matches!(a.value, Expr::Value(ref vs) if vs.value.to_string() == "?"))
+                .count();
+            if let Some(param_pos) = extract_pk_eq_param(&pk_col_name, w, asgn_param_count) {
                 if let Some(pk_val) = bound.get(param_pos).map(|v| value_to_pk_str(v)) {
                     if let Some(&ri) = table.pk_index.get(&pk_val) {
                         if ri < table.rows.len() {
@@ -1852,7 +1907,7 @@ fn value_to_pk_str(v: &Value) -> String {
 }
 
 /// Detect `WHERE pk_col = ?` pattern and return the bound parameter index.
-fn extract_pk_eq_param(pk_col_name: &str, expr: &Expr) -> Option<usize> {
+fn extract_pk_eq_param(pk_col_name: &str, expr: &Expr, param_offset: usize) -> Option<usize> {
     let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr else { return None };
     let (col_expr, val_expr) = {
         let left_is_col = matches!(left.as_ref(), Expr::Identifier(_) | Expr::CompoundIdentifier(_));
@@ -1864,7 +1919,7 @@ fn extract_pk_eq_param(pk_col_name: &str, expr: &Expr) -> Option<usize> {
         _ => return None,
     };
     if !col_name.eq_ignore_ascii_case(pk_col_name) { return None; }
-    if matches!(val_expr, Expr::Value(vs) if vs.value.to_string() == "?") { Some(0) } else { None }
+    if matches!(val_expr, Expr::Value(vs) if vs.value.to_string() == "?") { Some(param_offset) } else { None }
 }
 
 /// Evaluate a WHERE clause with bound parameters (? slots resolved from `bound`).

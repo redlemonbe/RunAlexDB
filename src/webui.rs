@@ -166,7 +166,7 @@ fn api_query(db: &Engine, body: &str) -> String {
     }
 
     let current_db = if db_name.is_empty() { None } else { Some(db_name) };
-    let result = db.execute(&sql, &current_db);
+    let result = db.execute(&sql, &current_db, "root");
 
     match result {
         QueryResult::Ok { affected, last_insert_id } => {
