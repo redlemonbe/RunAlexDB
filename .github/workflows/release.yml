@@ -1,0 +1,109 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang mold musl-tools \
+            gcc-aarch64-linux-gnu \
+            libc6-dev-arm64-cross \
+            linux-libc-dev-arm64-cross
+
+      - name: Install aarch64-gnu linker wrapper
+        run: sudo install -m 755 scripts/aarch64-gnu-linker-wrapper /usr/local/bin/
+
+      - name: Install Rust toolchain
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          rustup target add x86_64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-gnu aarch64-unknown-linux-musl
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Build x86_64-gnu
+        run: cargo build --release --target x86_64-unknown-linux-gnu
+
+      - name: Build x86_64-musl
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: Build aarch64-gnu
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_gnu: aarch64-linux-gnu-ar
+          RING_HOST_CC: gcc
+        run: cargo build --release --target aarch64-unknown-linux-gnu
+
+      - name: Build aarch64-musl
+        env:
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          AR_aarch64_unknown_linux_musl: aarch64-linux-gnu-ar
+          RING_HOST_CC: gcc
+        run: cargo build --release --target aarch64-unknown-linux-musl
+
+      - name: Package binaries
+        run: |
+          cp target/x86_64-unknown-linux-gnu/release/runalexdb  runalexdb-x86_64-linux-gnu
+          cp target/x86_64-unknown-linux-musl/release/runalexdb runalexdb-x86_64-linux-musl
+          cp target/aarch64-unknown-linux-gnu/release/runalexdb  runalexdb-aarch64-linux-gnu
+          cp target/aarch64-unknown-linux-musl/release/runalexdb runalexdb-aarch64-linux-musl
+          sha256sum \
+            runalexdb-x86_64-linux-gnu \
+            runalexdb-x86_64-linux-musl \
+            runalexdb-aarch64-linux-gnu \
+            runalexdb-aarch64-linux-musl \
+            > SHA256SUMS
+
+      - name: Extract changelog fragment
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk "/^\#\# \[${VERSION}\]/{p=1;next} p && /^\#\# \[/{p=0} p" \
+            CHANGELOG.md | sed '/^---$/d' > CHANGELOG_FRAGMENT.md || true
+          [ -s CHANGELOG_FRAGMENT.md ] || echo "Release ${GITHUB_REF_NAME}" > CHANGELOG_FRAGMENT.md
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            gh release edit "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG_FRAGMENT.md
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --title "${GITHUB_REF_NAME}" \
+              --notes-file CHANGELOG_FRAGMENT.md
+          fi
+
+      - name: Upload assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${GITHUB_REF_NAME}" --clobber \
+            runalexdb-x86_64-linux-gnu \
+            runalexdb-x86_64-linux-musl \
+            runalexdb-aarch64-linux-gnu \
+            runalexdb-aarch64-linux-musl \
+            SHA256SUMS

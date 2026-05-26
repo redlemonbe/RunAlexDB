@@ -1,0 +1,10 @@
+#!/bin/bash
+filtered=()
+for arg in "$@"; do
+    case "$arg" in
+        -B*/x86_64-unknown-linux-gnu/*) continue ;;
+        -fuse-ld=lld)                   continue ;;
+    esac
+    filtered+=("$arg")
+done
+exec aarch64-linux-gnu-gcc "${filtered[@]}"
