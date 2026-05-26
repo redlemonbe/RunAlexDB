@@ -463,7 +463,7 @@ Description: String parameters are escaped as v.replace("'", "''") (SQL standard
 | **Severity** | LOW |
 | **CWE** | CWE-682 (Incorrect Calculation) |
 | **Discovered** | 2026-05-26 |
-| **Status** | Open |
+| **Status** | Fixed — v0.3.2 |
 
 Description: Values are stored as Option<String> in-memory. MAX/MIN use string comparison. On INTEGER columns, MAX(1, 2) returns "2" (correct by coincidence for single-digit), but any numeric ordering beyond lexicographic breaks. Observed: MAX(id) returns None when ids are integers.
 
@@ -698,10 +698,10 @@ At typical embedded DB workloads with fewer than 1000 distinct query templates, 
 | 10 | sqlparser crate not audited | A | Open |
 | 11 | Auth + command loop deadlocks | C | Fixed (C-001, C-002) |
 | 12 | MAX/MIN numeric ordering incorrect | C | Open (C-004) |
-| 13 | Privilege model never enforced | D | Open (D-002) |
+| 13 | Privilege model never enforced | D | Fixed v0.3.2 (D-002) |
 | 14 | L0 cache bypasses future privilege checks | D | Open (D-003) |
 | 15 | pk_index stale after prepared-stmt DELETE | D | Open (D-004) |
-| 16 | extract_pk_eq_param always returns 0 | D | Open (D-005) |
+| 16 | extract_pk_eq_param always returns 0 | D | Fixed v0.3.2 (D-005) |
 | 17 | CRC32 32-bit effective entropy | D | Accepted (D-007) |
 
 ## Audit trail (updated)
