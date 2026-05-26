@@ -116,6 +116,9 @@ pub struct Table {
     /// Column-oriented int64 store for AVX2 scans.
     /// col_int_data[col_idx] = Some(vec) for Int/BigInt columns, None otherwise.
     pub col_int_data: Vec<Option<Vec<i64>>>,
+    /// Column-oriented string store for SIMD/vectorised text scans.
+    /// col_str_data[col_idx] = Some(vec) for Text/VarChar columns, None otherwise.
+    pub col_str_data: Vec<Option<Vec<String>>>,
     pub next_auto: i64,
 }
 
@@ -509,6 +512,12 @@ impl Engine {
                     _ => None,
                 }
             }).collect();
+            let col_str_data: Vec<Option<Vec<String>>> = columns.iter().map(|c| {
+                match c.col_type {
+                    ColumnType::Text | ColumnType::VarChar(_) => Some(Vec::new()),
+                    _ => None,
+                }
+            }).collect();
             db.tables.insert(table_name.clone(), Table {
                 name: table_name,
                 schema: db_name.to_string(),
@@ -517,6 +526,7 @@ impl Engine {
                 pk_col_idx,
                 pk_index: HashMap::new(),
                 col_int_data,
+                col_str_data,
                 next_auto: 1,
             });
             QueryResult::ok(0, 0)
@@ -569,6 +579,16 @@ impl Engine {
                     let val = match row.get(ci) {
                         Some(Value::Int(n)) => *n,
                         _ => 0,
+                    };
+                    v.push(val);
+                }
+            }
+            // Maintain column-oriented string store (for SIMD text scans)
+            for (ci, store) in table.col_str_data.iter_mut().enumerate() {
+                if let Some(ref mut v) = store {
+                    let val = match row.get(ci) {
+                        Some(Value::Text(s)) => s.clone(),
+                        _ => String::new(),
                     };
                     v.push(val);
                 }
@@ -851,6 +871,10 @@ impl Engine {
                             if let (Some(ref mut store), Value::Int(n)) = (table.col_int_data.get_mut(idx).and_then(|x| x.as_mut()), &new_val) {
                                 if ri < store.len() { store[ri] = *n; }
                             }
+                            // Keep col_str_data in sync
+                            if let (Some(ref mut store), Value::Text(s)) = (table.col_str_data.get_mut(idx).and_then(|x| x.as_mut()), &new_val) {
+                                if ri < store.len() { store[ri] = s.clone(); }
+                            }
                             row[idx] = new_val;
                         }
                     }
@@ -909,6 +933,10 @@ impl Engine {
                     for store in table.col_int_data.iter_mut().flatten() {
                         if ri < store.len() { store.swap_remove(ri); }
                     }
+                    // Keep col_str_data in sync
+                    for store in table.col_str_data.iter_mut().flatten() {
+                        if ri < store.len() { store.swap_remove(ri); }
+                    }
                 }
             }
         } else {
@@ -921,6 +949,17 @@ impl Engine {
                 let pk_i = table.pk_col_idx.unwrap();
                 for (ri, row) in table.rows.iter().enumerate() {
                     table.pk_index.insert(row_pk_key(row, pk_i), ri);
+                }
+            }
+            // Rebuild col_int_data and col_str_data after bulk delete
+            for (ci, store) in table.col_int_data.iter_mut().enumerate() {
+                if let Some(ref mut v) = store {
+                    *v = table.rows.iter().map(|r| match r.get(ci) { Some(Value::Int(n)) => *n, _ => 0 }).collect();
+                }
+            }
+            for (ci, store) in table.col_str_data.iter_mut().enumerate() {
+                if let Some(ref mut v) = store {
+                    *v = table.rows.iter().map(|r| match r.get(ci) { Some(Value::Text(s)) => s.clone(), _ => String::new() }).collect();
                 }
             }
         }
@@ -1326,6 +1365,8 @@ impl Engine {
             }
 
             tracing::info!(user = %username, db = ?db_name, can_write, "GRANT");
+            drop(users); // release lock before bump
+            self.bump_write_gen();
             QueryResult::ok(0, 0)
         } else {
             QueryResult::err(1064, "GRANT: syntax error — missing TO")
@@ -1364,6 +1405,8 @@ impl Engine {
                 user.can_write = false;
             }
             tracing::info!(user = %username, db = ?db_name, "REVOKE");
+            drop(users); // release lock before bump
+            self.bump_write_gen();
             QueryResult::ok(0, 0)
         } else {
             QueryResult::err(1064, "REVOKE: syntax error — missing FROM")
@@ -1751,6 +1794,11 @@ impl Engine {
                     v.push(match row.get(ci) { Some(Value::Int(n)) => *n, _ => 0 });
                 }
             }
+            for (ci, store) in table.col_str_data.iter_mut().enumerate() {
+                if let Some(ref mut v) = store {
+                    v.push(match row.get(ci) { Some(Value::Text(s)) => s.clone(), _ => String::new() });
+                }
+            }
             table.rows.push(row);
         }
         QueryResult::ok(count, 0)
@@ -1787,6 +1835,9 @@ impl Engine {
                                     } else { expr_to_value(asgn.value.clone()) };
                                     if let (Some(store), Value::Int(n)) = (table.col_int_data.get_mut(idx).and_then(|x| x.as_mut()), &new_val) {
                                         if ri < store.len() { store[ri] = *n; }
+                                    }
+                                    if let (Some(store), Value::Text(s)) = (table.col_str_data.get_mut(idx).and_then(|x| x.as_mut()), &new_val) {
+                                        if ri < store.len() { store[ri] = s.clone(); }
                                     }
                                     table.rows[ri][idx] = new_val;
                                 }
@@ -1831,12 +1882,20 @@ impl Engine {
                 table.pk_index.insert(row_pk_key(row, pk_i), ri);
             }
         }
-        // Rebuild col_int_data to match the new row layout
+        // Rebuild col_int_data and col_str_data to match the new row layout
         for (ci, store) in table.col_int_data.iter_mut().enumerate() {
             if let Some(ref mut v) = store {
                 *v = table.rows.iter().map(|r| match r.get(ci) {
                     Some(crate::engine::Value::Int(n)) => *n,
                     _ => 0,
+                }).collect();
+            }
+        }
+        for (ci, store) in table.col_str_data.iter_mut().enumerate() {
+            if let Some(ref mut v) = store {
+                *v = table.rows.iter().map(|r| match r.get(ci) {
+                    Some(crate::engine::Value::Text(s)) => s.clone(),
+                    _ => String::new(),
                 }).collect();
             }
         }
@@ -1888,28 +1947,45 @@ fn extract_pk_eq(pk_col_name: &str, expr: &Expr) -> Option<String> {
 /// Returns Some(matching_indices) if a SIMD path was applicable, None otherwise.
 fn try_simd_scan(table: &Table, expr: &Expr) -> Option<Vec<usize>> {
     let Expr::BinaryOp { left, op, right } = expr else { return None };
-    // Only handle col OP literal patterns on Int columns
     let col_name = match left.as_ref() {
         Expr::Identifier(id) => id.value.as_str(),
         Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
         _ => return None,
     };
     let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
-    let store = table.col_int_data.get(col_idx)?.as_ref()?;
-    let target: i64 = match right.as_ref() {
-        Expr::Value(vs) => match &vs.value {
-            sqlparser::ast::Value::Number(n, _) => n.parse().ok()?,
+
+    // Try integer SIMD path first
+    if let Some(Some(int_store)) = table.col_int_data.get(col_idx) {
+        let target: i64 = match right.as_ref() {
+            Expr::Value(vs) => match &vs.value {
+                sqlparser::ast::Value::Number(n, _) => n.parse().ok()?,
+                _ => return None,
+            },
             _ => return None,
-        },
-        _ => return None,
-    };
-    let indices = match op {
-        BinaryOperator::Eq => crate::simd_scan::scan_eq_i64(store, target),
-        BinaryOperator::Gt => crate::simd_scan::scan_gt_i64(store, target),
-        BinaryOperator::Lt => crate::simd_scan::scan_lt_i64(store, target),
-        _ => return None,
-    };
-    Some(indices)
+        };
+        return Some(match op {
+            BinaryOperator::Eq => crate::simd_scan::scan_eq_i64(int_store, target),
+            BinaryOperator::Gt => crate::simd_scan::scan_gt_i64(int_store, target),
+            BinaryOperator::Lt => crate::simd_scan::scan_lt_i64(int_store, target),
+            _ => return None,
+        });
+    }
+
+    // Try string SIMD path for Eq only
+    if *op == BinaryOperator::Eq {
+        if let Some(Some(str_store)) = table.col_str_data.get(col_idx) {
+            let target: &str = match right.as_ref() {
+                Expr::Value(vs) => match &vs.value {
+                    sqlparser::ast::Value::SingleQuotedString(s) => s.as_str(),
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            return Some(crate::simd_scan::scan_eq_str(str_store, target));
+        }
+    }
+
+    None
 }
 
 /// Convert a bound Value to the string key used in pk_index.

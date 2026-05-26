@@ -148,3 +148,57 @@ unsafe fn scan_lt_avx2(data: &[i64], target: i64) -> Vec<usize> {
     while i < data.len() { if data[i] < target { out.push(i); } i += 1; }
     out
 }
+
+// ── String column scans ───────────────────────────────────────────────────
+
+/// Equality scan over a string column store. Returns sorted row indices where data[i] == target.
+/// Uses an AVX2 fast path for targets ≤ 32 bytes (compares first 32 bytes in one SIMD op,
+/// then falls back to byte comparison for the remainder). Scalar fallback on non-AVX2.
+pub fn scan_eq_str(data: &[String], target: &str) -> Vec<usize> {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && !target.is_empty() && target.len() <= 32 {
+        return unsafe { scan_eq_str_avx2(data, target) };
+    }
+    data.iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str() == target)
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// LIKE prefix scan: returns indices where data[i] starts with prefix.
+pub fn scan_prefix_str(data: &[String], prefix: &str) -> Vec<usize> {
+    data.iter()
+        .enumerate()
+        .filter(|(_, s)| s.as_str().starts_with(prefix))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_eq_str_avx2(data: &[String], target: &str) -> Vec<usize> {
+    use std::arch::x86_64::*;
+    let tb = target.as_bytes();
+    let tlen = tb.len();
+    // Build a 32-byte pattern padded with zeros
+    let mut pat = [0u8; 32];
+    pat[..tlen].copy_from_slice(tb);
+    let vpat = _mm256_loadu_si256(pat.as_ptr() as *const __m256i);
+    let mut out = Vec::with_capacity(16);
+    for (i, s) in data.iter().enumerate() {
+        let sb = s.as_bytes();
+        if sb.len() != tlen { continue; }
+        // For strings ≤ 32 bytes: build same padded buf and compare all 32 bytes
+        let mut buf = [0u8; 32];
+        buf[..tlen].copy_from_slice(sb);
+        let vbuf = _mm256_loadu_si256(buf.as_ptr() as *const __m256i);
+        let cmp = _mm256_cmpeq_epi8(vbuf, vpat);
+        let mask = _mm256_movemask_epi8(cmp) as u32;
+        // All tlen bytes must match; bits beyond tlen are 0==0 so they also match
+        if mask == 0xFFFF_FFFFu32 {
+            out.push(i);
+        }
+    }
+    out
+}
