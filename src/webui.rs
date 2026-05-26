@@ -65,7 +65,7 @@ pub async fn run(cfg: Config, db: Arc<Engine>) -> Result<()> {
                         http_response(204, "text/plain", b"")
                     }
                     // API routes — require valid key
-                    _ if path.starts_with("/api/") && !req_key.as_bytes().ct_eq(cfg.auth.webui_api_key.as_bytes()).unwrap_u8() == 0 => {
+                    _  if path.starts_with("/api/") && !bool::from(req_key.as_bytes().ct_eq(cfg.auth.webui_api_key.as_bytes())) => {
                         http_response(401, "application/json", br#"{"error":"Unauthorized"}"#)
                     }
                     ("GET", "/api/system") => {

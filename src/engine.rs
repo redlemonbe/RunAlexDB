@@ -1751,6 +1751,23 @@ impl Engine {
         let Some(table) = db.tables.get_mut(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
         let before = table.rows.len();
         table.rows.retain(|row| selection.map_or(false, |w| !eval_where_bound(row, &table.columns, w, bound)));
+        // Rebuild pk_index after bulk delete — indices shift after retain()
+        if table.pk_col_idx.is_some() {
+            table.pk_index.clear();
+            let pk_i = table.pk_col_idx.unwrap();
+            for (ri, row) in table.rows.iter().enumerate() {
+                table.pk_index.insert(row_pk_key(row, pk_i), ri);
+            }
+        }
+        // Rebuild col_int_data to match the new row layout
+        for (ci, store) in table.col_int_data.iter_mut().enumerate() {
+            if let Some(ref mut v) = store {
+                *v = table.rows.iter().map(|r| match r.get(ci) {
+                    Some(crate::engine::Value::Int(n)) => *n,
+                    _ => 0,
+                }).collect();
+            }
+        }
         QueryResult::ok((before - table.rows.len()) as u64, 0)
     }
 
