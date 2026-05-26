@@ -5,6 +5,7 @@ mod auth;
 mod server;
 mod webui;
 mod firewall;
+mod icmp_guard;
 
 use anyhow::Result;
 use tracing::info;
@@ -34,6 +35,9 @@ async fn main() -> Result<()> {
     ));
     fw.open(&fw_ports);
     let fw_cleanup = std::sync::Arc::clone(&fw);
+
+    // ICMP protection — with inter-process coordination via /var/run/icmp_guard.pid
+    let _icmp = icmp_guard::IcmpGuard::setup(cfg.icmp_protection);
 
     // Start MySQL listener and web UI concurrently
     let db = std::sync::Arc::new(engine::Engine::new(&cfg));

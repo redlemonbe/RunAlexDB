@@ -30,6 +30,8 @@ pub struct Config {
     pub firewall_backend: Option<String>,
     #[serde(default = "default_fw_tag")]
     pub firewall_tag:     String,
+    #[serde(default = "default_icmp_protection")]
+    pub icmp_protection: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -102,6 +104,9 @@ impl Default for Config {
             firewall_manage:  default_fw_manage(),
             firewall_backend: None,
             firewall_tag:     default_fw_tag(),
+            icmp_protection: default_icmp_protection(),
         }
     }
 }
+
+fn default_icmp_protection() -> bool { true }

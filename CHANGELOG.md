@@ -1,5 +1,16 @@
 # Changelog — RunAlexDB
 
+## [0.2.1] — 2026-05-26
+
+### Added
+
+- **ICMP flood protection** (on by default): rate-limits ICMP echo-request to 5/s burst 10 via iptables/nftables. IPv4 + IPv6. Config: `icmp_protection = true` (TOML).
+- **Inter-process coordination**: shares `/var/run/icmp_guard.pid` lock with RunNginx and Runbound — only one program sets up ICMP rules at a time. Second instance detects the live owner and skips setup silently.
+
+Closes #12
+
+---
+
 ## [0.2.0] — 2026-05-26
 
 ### Added
