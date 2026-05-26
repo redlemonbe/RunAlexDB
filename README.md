@@ -31,6 +31,16 @@ Any MySQL or MariaDB client connects without modification — `mysql` CLI, PHP P
 ---
 
 
+## What's new in v0.1.5
+
+| Feature | Details |
+|---------|---------|
+| Hot backup | `POST /api/backup` — dump all databases to `data_dir/backups/backup_<ts>[_label].sql` |
+| Backup listing | `GET /api/backups` — JSON list of backups with id, size, timestamp |
+| Hot restore | `POST /api/restore {"id":"..."}` — reload all databases from a backup while running |
+| Auto-persist | On SIGTERM/ctrl-c, full SQL dump saved to `data_dir/runalexdb.sql` before exit |
+| Auto-load | If `data_dir/runalexdb.sql` exists at startup, data is reloaded automatically |
+
 ## What's new in v0.1.1
 
 - **Firewall auto-management** — RunAlexDB opens and closes its MySQL and admin UI ports automatically (ufw/nftables/iptables). See configuration below.
