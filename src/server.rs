@@ -191,8 +191,11 @@ where
     let mut stmt_cache: std::collections::HashMap<u32, PreparedStmt> = std::collections::HashMap::new();
     let mut next_stmt_id: u32 = 1;
     loop {
-        let n = stream.read_buf(&mut buf).await?;
-        if n == 0 { return Ok(()); }
+        // If buf already has data (pre-read before calling us), skip the network read.
+        if buf.is_empty() {
+            let n = stream.read_buf(&mut buf).await?;
+            if n == 0 { return Ok(()); }
+        }
         if let Some((payload, _seq)) = protocol::decode_packet(&mut buf) {
             if payload.len() < 32 { break; }
             let caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
@@ -259,14 +262,6 @@ where
         if buf.is_empty() {
             let n = stream.read_buf(&mut buf).await?;
             if n == 0 { return Ok(()); }
-        } else {
-            // Try to read more without blocking, then fall back
-            match stream.read_buf(&mut buf).await {
-                Ok(0) => return Ok(()),
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(e.into()),
-            }
         }
 
         while let Some((payload, _seq)) = protocol::decode_packet(&mut buf) {
