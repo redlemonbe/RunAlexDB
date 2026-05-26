@@ -1,5 +1,18 @@
 # Changelog — RunAlexDB
 
+## [0.1.4] — 2026-05-26
+
+### Added
+
+- **INFORMATION_SCHEMA.TABLES**: returns table list with schema, name, type, engine, and row count. Compatible with DBeaver, phpMyAdmin, Adminer, MySQL Workbench.
+- **INFORMATION_SCHEMA.COLUMNS**: returns column list with name, position, type, nullability, and key info. Used by ORM tools for schema introspection.
+- **INFORMATION_SCHEMA.SCHEMATA**: returns database list.
+- **SHOW VARIABLES / SHOW SESSION VARIABLES**: returns common MySQL variables (charset, max_allowed_packet, timeouts, sql_mode) — satisfies client connection handshakes.
+- **SHOW STATUS / SHOW GLOBAL STATUS**: returns basic status (Uptime, Threads_connected).
+- **SET / BEGIN / COMMIT / ROLLBACK**: silently accepted and return OK — allows applications using transaction wrappers to connect without errors.
+
+---
+
 ## [0.1.3] — 2026-05-26
 
 ### Added

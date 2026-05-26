@@ -142,6 +142,118 @@ impl Engine {
             return QueryResult::ok(0, 0);
         }
 
+        // SET statements (ignored — just return OK)
+        if sql_upper.starts_with("SET ") || sql_upper == "BEGIN" || sql_upper == "COMMIT"
+            || sql_upper == "ROLLBACK" || sql_upper == "ROLLBACK;" || sql_upper == "COMMIT;" {
+            return QueryResult::ok(0, 0);
+        }
+
+        // INFORMATION_SCHEMA.TABLES
+        if sql_upper.contains("INFORMATION_SCHEMA.TABLES") || sql_upper.contains("INFORMATION_SCHEMA.`TABLES`") {
+            let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+            let cols = vec!["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "TABLE_ROWS"];
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+            for (db_name, db_arc) in dbs.iter() {
+                if db_name.starts_with("information_schema") || db_name.starts_with("performance_schema") {
+                    continue;
+                }
+                let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                for (tname, table) in &db.tables {
+                    rows.push(vec![
+                        Some("def".into()),
+                        Some(db_name.clone()),
+                        Some(tname.clone()),
+                        Some("BASE TABLE".into()),
+                        Some("RunAlexDB".into()),
+                        Some(table.rows.len().to_string()),
+                    ]);
+                }
+            }
+            return QueryResult::rows(cols, rows);
+        }
+
+        // INFORMATION_SCHEMA.COLUMNS
+        if sql_upper.contains("INFORMATION_SCHEMA.COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA.`COLUMNS`") {
+            let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+            let cols = vec!["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY"];
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+            for (db_name, db_arc) in dbs.iter() {
+                if db_name.starts_with("information_schema") || db_name.starts_with("performance_schema") {
+                    continue;
+                }
+                let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                for (tname, table) in &db.tables {
+                    for (pos, col) in table.columns.iter().enumerate() {
+                        let col_type_str = match &col.col_type {
+                            crate::engine::ColumnType::Int => "int".to_string(),
+                            crate::engine::ColumnType::BigInt => "bigint".to_string(),
+                            crate::engine::ColumnType::Float => "double".to_string(),
+                            crate::engine::ColumnType::VarChar(n) => format!("varchar({})", n),
+                            crate::engine::ColumnType::Text => "text".to_string(),
+                            crate::engine::ColumnType::Blob => "blob".to_string(),
+                            crate::engine::ColumnType::Timestamp => "timestamp".to_string(),
+                        };
+                        rows.push(vec![
+                            Some("def".into()),
+                            Some(db_name.clone()),
+                            Some(tname.clone()),
+                            Some(col.name.clone()),
+                            Some((pos + 1).to_string()),
+                            Some(col_type_str),
+                            Some(if col.nullable { "YES" } else { "NO" }.into()),
+                            Some(if col.primary_key { "PRI" } else { "" }.into()),
+                        ]);
+                    }
+                }
+            }
+            return QueryResult::rows(cols, rows);
+        }
+
+        // INFORMATION_SCHEMA.SCHEMATA
+        if sql_upper.contains("INFORMATION_SCHEMA.SCHEMATA") {
+            let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+            let cols = vec!["CATALOG_NAME", "SCHEMA_NAME", "DEFAULT_CHARACTER_SET_NAME", "DEFAULT_COLLATION_NAME"];
+            let rows: Vec<Vec<Option<String>>> = dbs.keys()
+                .filter(|n| !n.starts_with("information_schema") && !n.starts_with("performance_schema") && n.as_str() != "mysql" && n.as_str() != "sys")
+                .map(|n| vec![
+                    Some("def".into()),
+                    Some(n.clone()),
+                    Some("utf8mb4".to_owned()),
+                    Some("utf8mb4_0900_ai_ci".to_owned()),
+                ])
+                .collect();
+            return QueryResult::rows(cols, rows);
+        }
+
+        // SHOW VARIABLES (clients check these)
+        if sql_upper.starts_with("SHOW VARIABLES") || sql_upper.starts_with("SHOW SESSION VARIABLES") {
+            return QueryResult::rows(
+                vec!["Variable_name", "Value"],
+                vec![
+                    vec![Some("character_set_client".to_owned()), Some("utf8mb4".to_owned())],
+                    vec![Some("character_set_connection".to_owned()), Some("utf8mb4".to_owned())],
+                    vec![Some("character_set_results".to_owned()), Some("utf8mb4".to_owned())],
+                    vec![Some("collation_connection".to_owned()), Some("utf8mb4_0900_ai_ci".to_owned())],
+                    vec![Some("max_allowed_packet".to_owned()), Some("67108864".to_owned())],
+                    vec![Some("net_write_timeout".to_owned()), Some("60".to_owned())],
+                    vec![Some("interactive_timeout".to_owned()), Some("28800".to_owned())],
+                    vec![Some("wait_timeout".to_owned()), Some("28800".to_owned())],
+                    vec![Some("sql_mode".to_owned()), Some("STRICT_TRANS_TABLES".to_owned())],
+                ],
+            );
+        }
+
+        // SHOW STATUS
+        if sql_upper.starts_with("SHOW STATUS") || sql_upper.starts_with("SHOW GLOBAL STATUS") {
+            return QueryResult::rows(
+                vec!["Variable_name", "Value"],
+                vec![
+                    vec![Some("Uptime".to_owned()), Some("0".to_owned())],
+                    vec![Some("Threads_connected".to_owned()), Some("1".to_owned())],
+                ],
+            );
+        }
+
         // Parse with sqlparser
         let dialect = MySqlDialect {};
         let stmts = match Parser::parse_sql(&dialect, sql) {
