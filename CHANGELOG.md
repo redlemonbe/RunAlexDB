@@ -1,5 +1,21 @@
 # Changelog — RunAlexDB
 
+## [0.2.2] — 2026-05-26
+
+### Added
+
+- **COM_STMT_PREPARE** (0x16): parses SQL, counts `?` parameters, returns stmt_id in `COM_STMT_PREPARE_OK`. Parameter column definitions sent for clients that need them.
+- **COM_STMT_EXECUTE** (0x17): binary parameter parsing (TINY, SHORT, LONG, LONGLONG, FLOAT, DOUBLE, all string/blob types, DATE, DATETIME, TIMESTAMP). Parameters substituted into SQL before execution. Results returned in binary row format.
+- **COM_STMT_CLOSE** (0x19): frees the statement from the per-connection cache.
+- **COM_STMT_RESET** (0x1a): keeps statement, returns OK.
+- Statement cache per connection (`HashMap<u32, PreparedStmt>`), independent per session.
+- `binary_row()` protocol helper for `COM_STMT_EXECUTE` result sets.
+- `parse_execute_params()` — full binary parameter decoder.
+
+Closes #9
+
+---
+
 ## [0.2.1] — 2026-05-26
 
 ### Added

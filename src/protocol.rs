@@ -99,6 +99,11 @@ pub enum Command {
     Quit,
     InitDb(String),
     FieldList(String),
+    StmtPrepare(String),
+    /// stmt_id is set; params vec is empty — server.rs re-parses from raw payload.
+    StmtExecute(u32),
+    StmtClose(u32),
+    StmtReset(u32),
     Unknown(u8),
 }
 
@@ -110,6 +115,25 @@ pub fn parse_command(payload: &[u8]) -> Command {
         0x03 => Command::Query(String::from_utf8_lossy(&payload[1..]).into_owned()),
         0x04 => Command::FieldList(String::from_utf8_lossy(&payload[1..]).into_owned()),
         0x0e => Command::Ping,
+        0x16 => Command::StmtPrepare(String::from_utf8_lossy(&payload[1..]).into_owned()),
+        0x17 => {
+            if payload.len() >= 5 {
+                let id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                Command::StmtExecute(id)
+            } else { Command::Unknown(0x17) }
+        }
+        0x19 => {
+            if payload.len() >= 5 {
+                let id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                Command::StmtClose(id)
+            } else { Command::Unknown(0x19) }
+        }
+        0x1a => {
+            if payload.len() >= 5 {
+                let id = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                Command::StmtReset(id)
+            } else { Command::Unknown(0x1a) }
+        }
         other => Command::Unknown(other),
     }
 }
@@ -205,4 +229,147 @@ fn put_lenenc(out: &mut BytesMut, v: u64) {
 fn put_lenenc_str(out: &mut BytesMut, s: &str) {
     put_lenenc(out, s.len() as u64);
     out.put_slice(s.as_bytes());
+}
+
+// ── Prepared statement packets ──────────────────────────────────────────────
+
+pub fn stmt_prepare_ok(stmt_id: u32, num_params: u16, num_columns: u16) -> Bytes {
+    let mut out = BytesMut::new();
+    out.put_u8(0x00);
+    out.put_u32_le(stmt_id);
+    out.put_u16_le(num_columns);
+    out.put_u16_le(num_params);
+    out.put_u8(0);
+    out.put_u16_le(0);
+    out.freeze()
+}
+
+/// Binary result-set row (for COM_STMT_EXECUTE responses).
+pub fn binary_row(values: &[Option<&str>]) -> Bytes {
+    let n = values.len();
+    let null_bitmap_len = (n + 7 + 2) / 8;
+    let mut null_bitmap = vec![0u8; null_bitmap_len];
+    for (i, v) in values.iter().enumerate() {
+        if v.is_none() {
+            let bit = i + 2;
+            null_bitmap[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    let mut out = BytesMut::new();
+    out.put_u8(0x00);
+    out.put_slice(&null_bitmap);
+    for v in values {
+        if let Some(s) = v {
+            put_lenenc_str(&mut out, s);
+        }
+    }
+    out.freeze()
+}
+
+/// Parse the binary parameter values from a COM_STMT_EXECUTE payload.
+/// Returns Vec<Option<String>>: None = SQL NULL.
+pub fn parse_execute_params(payload: &[u8], num_params: u16) -> Vec<Option<String>> {
+    let n = num_params as usize;
+    if n == 0 || payload.len() < 10 { return vec![]; }
+    // null bitmap starts at offset 10, length = ceil(n/8)
+    let bitmap_len = (n + 7) / 8;
+    if payload.len() < 10 + bitmap_len { return vec![None; n]; }
+    let null_bitmap = &payload[10..10 + bitmap_len];
+    let mut pos = 10 + bitmap_len;
+
+    let new_bound = if pos < payload.len() { payload[pos] } else { 0 };
+    pos += 1;
+
+    let mut types = vec![(0xfd_u8, false); n];
+    if new_bound == 1 && pos + n * 2 <= payload.len() {
+        for t in types.iter_mut() {
+            t.0 = payload[pos];
+            t.1 = payload[pos + 1] != 0;
+            pos += 2;
+        }
+    }
+
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let is_null = (null_bitmap[i / 8] >> (i % 8)) & 1 == 1;
+        if is_null { result.push(None); continue; }
+        let val = read_binary_param(payload, &mut pos, types[i].0);
+        result.push(Some(val));
+    }
+    result
+}
+
+fn read_binary_param(payload: &[u8], pos: &mut usize, type_byte: u8) -> String {
+    if *pos >= payload.len() { return String::new(); }
+    match type_byte {
+        0x01 => { // TINY
+            let v = payload[*pos] as i8; *pos += 1; v.to_string()
+        }
+        0x02 | 0x82 => { // SHORT
+            if *pos + 2 > payload.len() { return String::new(); }
+            let v = i16::from_le_bytes([payload[*pos], payload[*pos+1]]); *pos += 2; v.to_string()
+        }
+        0x03 | 0x09 => { // LONG / INT24
+            if *pos + 4 > payload.len() { return String::new(); }
+            let v = i32::from_le_bytes(payload[*pos..*pos+4].try_into().unwrap_or_default()); *pos += 4; v.to_string()
+        }
+        0x04 => { // FLOAT
+            if *pos + 4 > payload.len() { return String::new(); }
+            let v = f32::from_le_bytes(payload[*pos..*pos+4].try_into().unwrap_or_default()); *pos += 4; format!("{v}")
+        }
+        0x05 => { // DOUBLE
+            if *pos + 8 > payload.len() { return String::new(); }
+            let v = f64::from_le_bytes(payload[*pos..*pos+8].try_into().unwrap_or_default()); *pos += 8; format!("{v}")
+        }
+        0x08 => { // LONGLONG
+            if *pos + 8 > payload.len() { return String::new(); }
+            let v = i64::from_le_bytes(payload[*pos..*pos+8].try_into().unwrap_or_default()); *pos += 8; v.to_string()
+        }
+        0x0a | 0x0e => read_binary_date(payload, pos),
+        0x07 | 0x0b | 0x0c => read_binary_datetime(payload, pos),
+        _ => read_lenenc_bytes_as_str(payload, pos),
+    }
+}
+
+fn read_lenenc_bytes_as_str(payload: &[u8], pos: &mut usize) -> String {
+    if *pos >= payload.len() { return String::new(); }
+    let (len, inc): (usize, usize) = match payload[*pos] {
+        0xfb => { *pos += 1; return String::new(); }
+        0xfc => {
+            if *pos + 2 >= payload.len() { return String::new(); }
+            (u16::from_le_bytes([payload[*pos+1], payload[*pos+2]]) as usize, 3)
+        }
+        0xfd => {
+            if *pos + 3 >= payload.len() { return String::new(); }
+            let l = (payload[*pos+1] as usize) | ((payload[*pos+2] as usize) << 8) | ((payload[*pos+3] as usize) << 16);
+            (l, 4)
+        }
+        n => (n as usize, 1),
+    };
+    *pos += inc;
+    if *pos + len > payload.len() { return String::new(); }
+    let s = String::from_utf8_lossy(&payload[*pos..*pos+len]).into_owned();
+    *pos += len;
+    s
+}
+
+fn read_binary_date(payload: &[u8], pos: &mut usize) -> String {
+    if *pos >= payload.len() { return "0000-00-00".to_owned(); }
+    let len = payload[*pos] as usize; *pos += 1;
+    if len < 4 || *pos + 4 > payload.len() { *pos += len; return "0000-00-00".to_owned(); }
+    let y = u16::from_le_bytes([payload[*pos], payload[*pos+1]]);
+    let m = payload[*pos+2]; let d = payload[*pos+3];
+    *pos += len;
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn read_binary_datetime(payload: &[u8], pos: &mut usize) -> String {
+    if *pos >= payload.len() { return "0000-00-00 00:00:00".to_owned(); }
+    let len = payload[*pos] as usize; *pos += 1;
+    if len < 4 || *pos + len > payload.len() { *pos += len; return "0000-00-00 00:00:00".to_owned(); }
+    let y = u16::from_le_bytes([payload[*pos], payload[*pos+1]]);
+    let mo = payload[*pos+2]; let d = payload[*pos+3];
+    let (h, mi, s) = if len >= 7 { (payload[*pos+4], payload[*pos+5], payload[*pos+6]) } else { (0,0,0) };
+    *pos += len;
+    format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }

@@ -14,8 +14,8 @@ use crate::auth::{generate_scramble, verify_native_password};
 use crate::config::Config;
 use crate::engine::{Engine, QueryResult};
 use crate::protocol::{
-    self, column_def, eof_packet, encode_packet, err_packet, ok_packet, parse_command,
-    server_greeting, server_greeting_tls, text_row, Command, CAPABILITY_SSL,
+    self, binary_row, column_def, eof_packet, encode_packet, err_packet, ok_packet, parse_command,
+    parse_execute_params, stmt_prepare_ok, server_greeting, server_greeting_tls, text_row, Command, CAPABILITY_SSL,
 };
 
 const MAX_CONNECTIONS: usize = 256;
@@ -57,6 +57,12 @@ fn make_tls_acceptor(cfg: &Config) -> anyhow::Result<tokio_rustls::TlsAcceptor> 
 }
 
 // ── Listener ───────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct PreparedStmt {
+    sql: String,
+    num_params: u16,
+}
 
 pub async fn run(cfg: Config, db: Arc<Engine>) -> Result<()> {
     let addr = format!("{}:{}", cfg.bind, cfg.mysql_port);
@@ -182,6 +188,8 @@ where
 {
     // ── Handshake loop ──
     let mut current_db: Option<String> = None;
+    let mut stmt_cache: std::collections::HashMap<u32, PreparedStmt> = std::collections::HashMap::new();
+    let mut next_stmt_id: u32 = 1;
     loop {
         let n = stream.read_buf(&mut buf).await?;
         if n == 0 { return Ok(()); }
@@ -287,6 +295,55 @@ where
                 Command::FieldList(_) => {
                     stream.write_all(&encode_packet(&eof_packet(), 1)).await?;
                 }
+                Command::StmtPrepare(sql) => {
+                    let num_params = sql.bytes().filter(|&b| b == b'?').count() as u16;
+                    let stmt_id = next_stmt_id;
+                    next_stmt_id += 1;
+                    stmt_cache.insert(stmt_id, PreparedStmt { sql, num_params });
+                    stream.write_all(&encode_packet(&stmt_prepare_ok(stmt_id, num_params, 0), 1)).await?;
+                    if num_params > 0 {
+                        let mut s = 2u8;
+                        for _ in 0..num_params {
+                            stream.write_all(&encode_packet(&column_def("", "", "?", 0xfd, 0), s)).await?;
+                            s = s.wrapping_add(1);
+                        }
+                        stream.write_all(&encode_packet(&eof_packet(), s)).await?;
+                    }
+                }
+                Command::StmtExecute(stmt_id) => {
+                    let stmt = match stmt_cache.get(&stmt_id).cloned() {
+                        Some(s) => s,
+                        None => {
+                            stream.write_all(&encode_packet(&err_packet(1243, "Unknown prepared statement handler"), 1)).await?;
+                            continue;
+                        }
+                    };
+                    let params = parse_execute_params(&payload, stmt.num_params);
+                    // Substitute ? placeholders
+                    let mut sql = stmt.sql.clone();
+                    for param in &params {
+                        let repl = match param {
+                            None => "NULL".to_owned(),
+                            Some(v) if v.parse::<f64>().is_ok() => v.clone(),
+                            Some(v) => format!("'{}'", v.replace('\'', "''")),
+                        };
+                        if let Some(p) = sql.find('?') {
+                            sql.replace_range(p..p+1, &repl);
+                        }
+                    }
+                    let result = db.execute(&sql, &current_db);
+                    send_result_binary(&mut stream, result, 1).await?;
+                }
+                Command::StmtClose(stmt_id) => {
+                    stmt_cache.remove(&stmt_id);
+                }
+                Command::StmtReset(stmt_id) => {
+                    if stmt_cache.contains_key(&stmt_id) {
+                        stream.write_all(&encode_packet(&ok_packet(0, 0), 1)).await?;
+                    } else {
+                        stream.write_all(&encode_packet(&err_packet(1243, "Unknown prepared statement handler"), 1)).await?;
+                    }
+                }
                 Command::Unknown(c) => {
                     let msg = format!("Unknown command 0x{c:02x}");
                     stream.write_all(&encode_packet(&err_packet(1047, &msg), 1)).await?;
@@ -326,6 +383,36 @@ where
                 let vals: Vec<Option<&str>> = row.iter().map(|v| v.as_deref()).collect();
                 stream.write_all(&encode_packet(&text_row(&vals), seq)).await?;
                 seq += 1;
+            }
+            stream.write_all(&encode_packet(&eof_packet(), seq)).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn send_result_binary<S>(stream: &mut S, result: crate::engine::QueryResult, mut seq: u8) -> anyhow::Result<()>
+where S: tokio::io::AsyncWrite + Unpin {
+    use crate::engine::QueryResult;
+    match result {
+        QueryResult::Ok { affected, last_insert_id } => {
+            stream.write_all(&encode_packet(&ok_packet(affected, last_insert_id), seq)).await?;
+        }
+        QueryResult::Err { code, message } => {
+            stream.write_all(&encode_packet(&err_packet(code, &message), seq)).await?;
+        }
+        QueryResult::Rows { columns, rows } => {
+            let mut cnt = BytesMut::new();
+            cnt.extend_from_slice(&[columns.len() as u8]);
+            stream.write_all(&encode_packet(&cnt, seq)).await?; seq = seq.wrapping_add(1);
+            for col in &columns {
+                stream.write_all(&encode_packet(&column_def("", "", col, 0xfd, 0), seq)).await?;
+                seq = seq.wrapping_add(1);
+            }
+            stream.write_all(&encode_packet(&eof_packet(), seq)).await?; seq = seq.wrapping_add(1);
+            for row in &rows {
+                let vals: Vec<Option<&str>> = row.iter().map(|v| v.as_deref()).collect();
+                stream.write_all(&encode_packet(&binary_row(&vals), seq)).await?;
+                seq = seq.wrapping_add(1);
             }
             stream.write_all(&encode_packet(&eof_packet(), seq)).await?;
         }
