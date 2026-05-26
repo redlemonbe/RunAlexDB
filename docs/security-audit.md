@@ -642,7 +642,7 @@ Single-parameter queries (the benchmark pattern) work by coincidence.
 | **Source** | [AI-INTERNAL] |
 | **File** | `src/server.rs` — `run_authenticated_session()` |
 | **Discovered** | 2026-05-26 |
-| **Status** | ⏳ Open |
+| **Status** | ✅ Fixed — v0.3.3 |
 
 **Description:** All `stream.read_buf(&mut buf).await` calls have no timeout. A client that completes the MySQL handshake (consumes an auth slot) but never sends further queries holds a connection permit indefinitely. 256 such clients exhaust the semaphore; no new connections can be accepted.
 
