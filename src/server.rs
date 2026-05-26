@@ -54,6 +54,7 @@ async fn handle_connection(
 
     // Read handshake response
     let mut buf = BytesMut::with_capacity(4096);
+    let mut current_db: Option<String> = None;
     loop {
         let n = stream.read_buf(&mut buf).await?;
         if n == 0 { return Ok(()); }
@@ -61,7 +62,6 @@ async fn handle_connection(
             // Parse HandshakeResponse41
             if payload.len() < 32 { break; }
             let caps = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-            let _ = caps;
             // username starts after: caps(4) + max_packet(4) + charset(1) + reserved(23) = offset 32
             if payload.len() < 33 { break; }
             let rest = &payload[32..];
@@ -81,13 +81,37 @@ async fn handle_connection(
                 stream.write_all(&encode_packet(&err_packet(1045, "Access denied"), 2)).await?;
                 return Ok(());
             }
+            // Extract database name from HandshakeResponse41 if CLIENT_CONNECT_WITH_DB is set
+            // After auth_response, there may be a null-terminated db name
+            let connect_with_db: u32 = 1 << 3; // CLIENT_CONNECT_WITH_DB
+            let db_from_handshake: Option<String> = if caps & connect_with_db != 0 {
+                // rest is already past username+NUL; rest[0]=auth_len, rest[1..1+len]=auth bytes
+                let auth_len = if rest.is_empty() { 0 } else { rest[0] as usize };
+                let db_offset = 1 + auth_len;
+                let rest2 = if db_offset <= rest.len() { &rest[db_offset..] } else { &[][..] };
+                if let Some(end) = rest2.iter().position(|&b| b == 0) {
+                    let name = String::from_utf8_lossy(&rest2[..end]).trim().to_owned();
+                    if !name.is_empty() { Some(name) } else { None }
+                } else if !rest2.is_empty() {
+                    let name = String::from_utf8_lossy(rest2).trim().trim_matches('\0').to_owned();
+                    if !name.is_empty() { Some(name) } else { None }
+                } else {
+                    None
+                }
+            } else { None };
+            debug!("handshake: caps={:#010x}, connect_with_db_flag={:?}, db_from_handshake={:?}", caps, caps & connect_with_db != 0, db_from_handshake);
+            // Auto-create database if specified in handshake but not yet in engine
+            if let Some(ref db_name) = db_from_handshake {
+                db.ensure_database(db_name);
+            }
+            // Set current_db from handshake before breaking
+            current_db = db_from_handshake;
             stream.write_all(&encode_packet(&ok_packet(0, 0), 2)).await?;
             break;
         }
     }
 
-    // Command loop
-    let mut current_db: Option<String> = None;
+    // Command loop — current_db set from handshake (or None for no initial db)
     loop {
         if buf.is_empty() {
             let n = stream.read_buf(&mut buf).await?;
@@ -109,6 +133,7 @@ async fn handle_connection(
         while let Some((payload, _seq)) = protocol::decode_packet(&mut buf) {
             let cmd = parse_command(&payload);
             debug!("cmd from {peer}: {cmd:?}");
+            debug!("current_db for cmd: {:?}", current_db);
 
             match cmd {
                 Command::Quit => return Ok(()),

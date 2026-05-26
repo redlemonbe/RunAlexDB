@@ -162,7 +162,7 @@ impl Engine {
             }
             Statement::CreateTable(create) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
-                self.create_table(db_name, create.name, create.columns)
+                self.create_table(db_name, create.name, create.columns, create.if_not_exists)
             }
             Statement::Insert(insert) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
@@ -185,6 +185,13 @@ impl Engine {
         }
     }
 
+    pub fn ensure_database(&self, name: &str) {
+        let mut dbs = self.databases.write().unwrap_or_else(|e| e.into_inner());
+        dbs.entry(name.to_string()).or_insert_with(|| {
+            Arc::new(RwLock::new(Database { name: name.to_string(), tables: HashMap::new() }))
+        });
+    }
+
     fn create_database(&self, name: &str) -> QueryResult {
         let mut dbs = self.databases.write().unwrap_or_else(|e| e.into_inner());
         dbs.entry(name.to_string()).or_insert_with(|| {
@@ -198,6 +205,7 @@ impl Engine {
         db_name: &str,
         name: ObjectName,
         col_defs: Vec<ColumnDef>,
+        if_not_exists: bool,
     ) -> QueryResult {
         let parts: Vec<String> = name.0.iter()
             .map(|p| p.as_ident().map(|i| i.value.clone()).unwrap_or_default())
@@ -221,6 +229,9 @@ impl Engine {
         let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
         if let Some(db_arc) = dbs.get(&db_name) {
             let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+            if if_not_exists && db.tables.contains_key(&table_name) {
+                return QueryResult::ok(0, 0);
+            }
             db.tables.insert(table_name.clone(), Table {
                 name: table_name,
                 schema: db_name.to_string(),
@@ -310,6 +321,68 @@ impl Engine {
         let Some(table) = db.tables.get(&table_name) else {
             return QueryResult::err(1146, &format!("Table '{db_name}.{table_name}' doesn't exist"));
         };
+
+        // Check for aggregate-only projection (e.g. SELECT COUNT(*), COUNT(*) as n, MAX(id))
+        let is_aggregate_only = sel.projection.iter().all(|p| {
+            match p {
+                sqlparser::ast::SelectItem::UnnamedExpr(Expr::Function(_))
+                | sqlparser::ast::SelectItem::ExprWithAlias { expr: Expr::Function(_), .. } => true,
+                _ => false,
+            }
+        });
+
+        if is_aggregate_only && !sel.projection.is_empty() {
+            let agg_cols: Vec<String> = sel.projection.iter().map(|p| {
+                match p {
+                    sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    other => other.to_string(),
+                }
+            }).collect();
+            let agg_vals: Vec<Option<String>> = sel.projection.iter().map(|p| {
+                let func = match p {
+                    sqlparser::ast::SelectItem::UnnamedExpr(Expr::Function(f)) => f,
+                    sqlparser::ast::SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => f,
+                    _ => return None,
+                };
+                let fname = func.name.to_string().to_uppercase();
+                match fname.as_str() {
+                    COUNT => Some(table.rows.len().to_string()),
+                    MAX => {
+                        // Get column name from first arg
+                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
+                        let max_val = col_idx.and_then(|idx| {
+                            table.rows.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
+                                if let Value::Int(n) = v { Some(*n) } else { None }
+                            }).max()
+                        });
+                        max_val.map(|v| v.to_string())
+                    }
+                    MIN => {
+                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
+                        let min_val = col_idx.and_then(|idx| {
+                            table.rows.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
+                                if let Value::Int(n) = v { Some(*n) } else { None }
+                            }).min()
+                        });
+                        min_val.map(|v| v.to_string())
+                    }
+                    SUM => {
+                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
+                        let sum_val = col_idx.map(|idx| {
+                            table.rows.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
+                                if let Value::Int(n) = v { Some(*n) } else { None }
+                            }).sum::<i64>()
+                        });
+                        sum_val.map(|v| v.to_string())
+                    }
+                    _ => Some(0.to_string()),
+                }
+            }).collect();
+            return QueryResult::rows(agg_cols, vec![agg_vals]);
+        }
 
         let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
         let result_rows: Vec<Vec<Option<String>>> = table.rows.iter().map(|row| {
