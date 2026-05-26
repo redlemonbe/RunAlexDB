@@ -420,7 +420,7 @@ impl Engine {
             }
             Statement::Insert(insert) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
-                self.insert(db_name, &insert.table.to_string(), insert.source)
+                self.insert(db_name, &insert.table.to_string(), insert.source, insert.replace_into)
             }
             Statement::Query(q) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
@@ -468,6 +468,196 @@ impl Engine {
                 for store in table.col_str_data.iter_mut().flatten() { store.clear(); }
                 self.bump_write_gen();
                 QueryResult::ok(affected, 0)
+            }
+            Statement::ExplainTable { table_name, .. } => {
+                // DESCRIBE / DESC table_name
+                let name = table_name.to_string();
+                let (eff_db, eff_table) = if let Some(dot) = name.find('.') {
+                    (name[..dot].trim_matches('`').to_owned(), name[dot+1..].trim_matches('`').to_owned())
+                } else {
+                    (current_db.clone().unwrap_or_else(|| "test".to_owned()), name.trim_matches('`').to_owned())
+                };
+                let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+                let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                let Some(table) = db.tables.get(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+                let cols = vec!["Field", "Type", "Null", "Key", "Default", "Extra"];
+                let rows: Vec<Vec<Option<String>>> = table.columns.iter().map(|c| {
+                    let type_str = match &c.col_type {
+                        ColumnType::Int => "int".to_owned(),
+                        ColumnType::BigInt => "bigint".to_owned(),
+                        ColumnType::Float => "double".to_owned(),
+                        ColumnType::VarChar(n) => format!("varchar({})", n),
+                        ColumnType::Text => "text".to_owned(),
+                        ColumnType::Blob => "blob".to_owned(),
+                        ColumnType::Timestamp => "timestamp".to_owned(),
+                    };
+                    vec![
+                        Some(c.name.clone()),
+                        Some(type_str),
+                        Some(if c.nullable { "YES" } else { "NO" }.to_owned()),
+                        Some(if c.primary_key { "PRI" } else { "" }.to_owned()),
+                        None, // Default
+                        Some(if c.primary_key { "auto_increment" } else { "" }.to_owned()),
+                    ]
+                }).collect();
+                QueryResult::rows(cols, rows)
+            }
+            Statement::ShowColumns { show_options, .. } => {
+                // SHOW COLUMNS FROM table_name
+                if let Some(tbl) = show_options.show_in.as_ref().and_then(|si| si.parent_name.as_ref()) {
+                    let name = tbl.to_string();
+                    let (eff_db, eff_table) = if let Some(dot) = name.find('.') {
+                        (name[..dot].trim_matches('`').to_owned(), name[dot+1..].trim_matches('`').to_owned())
+                    } else {
+                        (current_db.clone().unwrap_or_else(|| "test".to_owned()), name.trim_matches('`').to_owned())
+                    };
+                    let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                    let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+                    let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                    let Some(table) = db.tables.get(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+                    let cols = vec!["Field", "Type", "Null", "Key", "Default", "Extra"];
+                    let rows: Vec<Vec<Option<String>>> = table.columns.iter().map(|c| {
+                        let type_str = match &c.col_type {
+                            ColumnType::Int => "int".to_owned(),
+                            ColumnType::BigInt => "bigint".to_owned(),
+                            ColumnType::Float => "double".to_owned(),
+                            ColumnType::VarChar(n) => format!("varchar({})", n),
+                            ColumnType::Text => "text".to_owned(),
+                            ColumnType::Blob => "blob".to_owned(),
+                            ColumnType::Timestamp => "timestamp".to_owned(),
+                        };
+                        vec![
+                            Some(c.name.clone()),
+                            Some(type_str),
+                            Some(if c.nullable { "YES" } else { "NO" }.to_owned()),
+                            Some(if c.primary_key { "PRI" } else { "" }.to_owned()),
+                            None,
+                            Some(if c.primary_key { "auto_increment" } else { "" }.to_owned()),
+                        ]
+                    }).collect();
+                    return QueryResult::rows(cols, rows);
+                }
+                QueryResult::err(1295, "SHOW COLUMNS requires FROM table_name")
+            }
+            Statement::ShowCreate { obj_type, obj_name } => {
+                use sqlparser::ast::ShowCreateObject;
+                if !matches!(obj_type, ShowCreateObject::Table) {
+                    return QueryResult::err(1295, "SHOW CREATE only supported for TABLE");
+                }
+                let name = obj_name.to_string();
+                let (eff_db, eff_table) = if let Some(dot) = name.find('.') {
+                    (name[..dot].trim_matches('`').to_owned(), name[dot+1..].trim_matches('`').to_owned())
+                } else {
+                    (current_db.clone().unwrap_or_else(|| "test".to_owned()), name.trim_matches('`').to_owned())
+                };
+                let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+                let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                let Some(table) = db.tables.get(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+                let mut ddl = format!("CREATE TABLE `{}` (
+", eff_table);
+                let col_defs: Vec<String> = table.columns.iter().map(|c| {
+                    let type_str = match &c.col_type {
+                        ColumnType::Int => "int".to_owned(),
+                        ColumnType::BigInt => "bigint".to_owned(),
+                        ColumnType::Float => "double".to_owned(),
+                        ColumnType::VarChar(n) => format!("varchar({})", n),
+                        ColumnType::Text => "text".to_owned(),
+                        ColumnType::Blob => "blob".to_owned(),
+                        ColumnType::Timestamp => "timestamp".to_owned(),
+                    };
+                    let null_str = if c.nullable { "" } else { " NOT NULL" };
+                    let pk_str = if c.primary_key { " PRIMARY KEY" } else { "" };
+                    format!("  `{}` {}{}{}", c.name, type_str, null_str, pk_str)
+                }).collect();
+                ddl.push_str(&col_defs.join(",
+"));
+                ddl.push_str("
+) ENGINE=RunAlexDB");
+                QueryResult::rows(vec!["Table", "Create Table"], vec![
+                    vec![Some(eff_table), Some(ddl)]
+                ])
+            }
+            Statement::AlterTable { name, operations, .. } => {
+                let tname = name.to_string();
+                let (eff_db, eff_table) = if let Some(dot) = tname.find('.') {
+                    (tname[..dot].trim_matches('`').to_owned(), tname[dot+1..].trim_matches('`').to_owned())
+                } else {
+                    (current_db.clone().unwrap_or_else(|| "test".to_owned()), tname.trim_matches('`').to_owned())
+                };
+                let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+                let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+                let Some(table) = db.tables.get_mut(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+                for op in operations {
+                    use sqlparser::ast::AlterTableOperation;
+                    match op {
+                        AlterTableOperation::AddColumn { column_def, .. } => {
+                            let col_name = column_def.name.to_string();
+                            if table.columns.iter().any(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                                return QueryResult::err(1060, &format!("Duplicate column name '{col_name}'"));
+                            }
+                            let col_type = sql_type_to_col_type(&column_def.data_type);
+                            let is_int = matches!(col_type, ColumnType::Int | ColumnType::BigInt);
+                            let is_str = matches!(col_type, ColumnType::VarChar(_) | ColumnType::Text);
+                            // Extend all existing rows with NULL
+                            for row in table.rows.iter_mut() {
+                                row.push(Value::Null);
+                            }
+                            // Extend column-oriented stores
+                            let new_idx = table.columns.len();
+                            if is_int {
+                                while table.col_int_data.len() <= new_idx { table.col_int_data.push(None); }
+                                let store: Vec<i64> = vec![0i64; table.rows.len()];
+                                table.col_int_data[new_idx] = Some(store);
+                            } else {
+                                while table.col_int_data.len() <= new_idx { table.col_int_data.push(None); }
+                            }
+                            if is_str {
+                                while table.col_str_data.len() <= new_idx { table.col_str_data.push(None); }
+                                let store: Vec<String> = vec![String::new(); table.rows.len()];
+                                table.col_str_data[new_idx] = Some(store);
+                            } else {
+                                while table.col_str_data.len() <= new_idx { table.col_str_data.push(None); }
+                            }
+                            table.columns.push(Column {
+                                name: col_name,
+                                col_type,
+                                nullable: true,
+                                primary_key: false,
+                            });
+                        }
+                        AlterTableOperation::DropColumn { column_name, .. } => {
+                            let name = column_name.to_string();
+                            let Some(drop_idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&name)) else {
+                                return QueryResult::err(1091, &format!("Can't DROP COLUMN '{}'", name));
+                            };
+                            if table.columns[drop_idx].primary_key {
+                                return QueryResult::err(1075, "Incorrect table definition: only one primary key allowed");
+                            }
+                            table.columns.remove(drop_idx);
+                            for row in table.rows.iter_mut() {
+                                if drop_idx < row.len() { row.remove(drop_idx); }
+                            }
+                            if drop_idx < table.col_int_data.len() { table.col_int_data.remove(drop_idx); }
+                            if drop_idx < table.col_str_data.len() { table.col_str_data.remove(drop_idx); }
+                            // Rebuild pk_col_idx after column removal
+                            table.pk_col_idx = table.columns.iter().position(|c| c.primary_key);
+                        }
+                        AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                            let old = old_column_name.to_string();
+                            let new = new_column_name.to_string();
+                            let Some(col) = table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(&old)) else {
+                                return QueryResult::err(1054, &format!("Unknown column '{}'", old));
+                            };
+                            col.name = new;
+                        }
+                        _ => {} // Other operations silently ignored
+                    }
+                }
+                self.bump_write_gen();
+                QueryResult::ok(0, 0)
             }
             _ => QueryResult::err(1295, "Statement not yet supported"),
         }
@@ -560,6 +750,7 @@ impl Engine {
         db_name: &str,
         table_name: &str,
         source: Option<Box<Query>>,
+        replace_into: bool,
     ) -> QueryResult {
         let Some(source) = source else {
             return QueryResult::err(1064, "INSERT without VALUES");
@@ -588,6 +779,27 @@ impl Engine {
         let count = rows.len() as u64;
         for row_exprs in rows {
             let row: Row = row_exprs.into_iter().map(expr_to_value).collect();
+            // REPLACE INTO: remove existing row with same PK before inserting
+            if replace_into {
+                if let Some(pk_idx) = table.pk_col_idx {
+                    let pk_key = row_pk_key(&row, pk_idx);
+                    if let Some(&old_pos) = table.pk_index.get(&pk_key) {
+                        table.rows.remove(old_pos);
+                        for store in table.col_int_data.iter_mut().flatten() {
+                            if old_pos < store.len() { store.remove(old_pos); }
+                        }
+                        for store in table.col_str_data.iter_mut().flatten() {
+                            if old_pos < store.len() { store.remove(old_pos); }
+                        }
+                        // Rebuild pk_index after removal (positions shifted)
+                        table.pk_index.clear();
+                        for (i, r) in table.rows.iter().enumerate() {
+                            let k = row_pk_key(r, pk_idx);
+                            table.pk_index.insert(k, i);
+                        }
+                    }
+                }
+            }
             // Maintain PK index
             if let Some(pk_idx) = table.pk_col_idx {
                 let pk_key = row_pk_key(&row, pk_idx);
