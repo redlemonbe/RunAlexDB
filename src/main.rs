@@ -2,6 +2,7 @@ mod config;
 mod protocol;
 mod engine;
 mod simd_scan;
+mod xdp;
 mod auth;
 mod server;
 mod webui;
@@ -9,7 +10,7 @@ mod firewall;
 mod icmp_guard;
 
 use anyhow::Result;
-use tracing::info;
+use tracing::{info, warn};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,6 +24,17 @@ async fn main() -> Result<()> {
     info!("RunAlexDB v{} starting", env!("CARGO_PKG_VERSION"));
     info!("MySQL port  : {}", cfg.mysql_port);
     info!("Admin UI    : http://0.0.0.0:{}", cfg.webui_port);
+
+    // XDP availability — log result, fall back silently if unavailable.
+    if cfg.xdp.enabled {
+        if xdp::check_available() {
+            info!("XDP         : available (kernel + bpf fs present)");
+        } else {
+            warn!("XDP         : not available on this host — falling back to standard TCP");
+        }
+    } else {
+        info!("XDP         : disabled in config");
+    }
 
     // Firewall — open MySQL + WebUI ports at startup, close on shutdown.
     let fw_ports: Vec<(u16, &'static str)> = vec![
