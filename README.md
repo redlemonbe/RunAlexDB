@@ -1,43 +1,80 @@
 # RunAlexDB
 
-High-performance SQL database — MySQL/MariaDB wire protocol, XDP fast-path, SIMD query engine.  
-Drop-in MariaDB replacement. Built-in admin UI. Static binary. No dependencies.
+## The World's First ASM-Accelerated SQL Database
 
-[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
+**MariaDB-compatible SQL database — XDP kernel-bypass, SIMD query engine, built-in admin UI.**
+
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE) [![Commercial License](https://img.shields.io/badge/license-commercial-green.svg)](COMMERCIAL_LICENSE.md)
 [![Release](https://img.shields.io/github/v/release/redlemonbe/RunAlexDB)](https://github.com/redlemonbe/RunAlexDB/releases/latest)
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
 
-> **Part of the [RunSoftware](https://github.com/redlemonbe) ecosystem.**  
-> Native integration with [RunNginx](https://github.com/redlemonbe/RunNginx) and [Runbound](https://github.com/redlemonbe/Runbound).
+> ⚠️ **Status: Alpha** — RunAlexDB is under active development. Current version stores data in memory only (persistence via WAL + B-Tree is roadmapped). Not yet recommended for production deployments.
+
+Any MySQL or MariaDB client connects without modification — `mysql` CLI, PHP PDO, Node `mysql2`, Python `mysql-connector`, DBeaver, HeidiSQL, TablePlus, Adminer. RunAlexDB adds XDP kernel-bypass, SIMD query acceleration, and a built-in admin UI on top.
 
 ---
 
-## Features
+## What you get
 
-- **100% MySQL/MariaDB wire protocol** — any MySQL client, ORM, or tool connects without modification
-- **XDP fast-path** — eBPF/XDP connection filter: SYN flood, rate limiting, IP banning at wire speed
-- **SIMD query engine** — AVX2/SSE4.2 for string comparison, CRC32c for index hashing
-- **Built-in admin UI** — SQL console, database browser, user management (port 8306)
-- **No system accounts** — virtual users, no /etc/passwd entries
-- **Static binary** — single file, no runtime dependencies, runs anywhere
+| | MySQL / MariaDB | PostgreSQL | SQLite | RunAlexDB |
+|---|:---:|:---:|:---:|:---:|
+| MySQL/MariaDB wire protocol | ✅ | ❌ | ❌ | ✅ |
+| XDP connection filter (SYN flood, bans) | ❌ | ❌ | ❌ | ✅ |
+| SIMD query engine (AVX2/SSE4.2) | ❌ | ❌ | ❌ | ✅ |
+| Built-in admin UI | ❌ phpMyAdmin separate | ❌ pgAdmin separate | ❌ | ✅ port 8306 |
+| Virtual users (no /etc/passwd) | ❌ | ❌ | n/a | ✅ |
+| REST API | ❌ | ❌ | ❌ | ✅ |
+| Master/slave replication | ✅ | ✅ | ❌ | roadmap |
+| Static binary, zero runtime deps | ❌ | ❌ | ✅ | ✅ musl |
+| WAL + B-Tree persistence | ✅ | ✅ | ✅ | roadmap |
+
+---
+
+## Install
+
+```bash
+# x86_64 glibc
+curl -Lo runalexdb https://github.com/redlemonbe/RunAlexDB/releases/latest/download/runalexdb-x86_64-linux-gnu
+chmod +x runalexdb && sudo mv runalexdb /usr/local/bin/
+
+# x86_64 static (musl — no glibc required)
+curl -Lo runalexdb https://github.com/redlemonbe/RunAlexDB/releases/latest/download/runalexdb-x86_64-linux-musl
+chmod +x runalexdb && sudo mv runalexdb /usr/local/bin/
+
+# aarch64 (Graviton, Raspberry Pi 4/5)
+curl -Lo runalexdb https://github.com/redlemonbe/RunAlexDB/releases/latest/download/runalexdb-aarch64-linux-gnu
+chmod +x runalexdb && sudo mv runalexdb /usr/local/bin/
+```
 
 ---
 
 ## Quick start
 
 ```bash
-# Install
-curl -Lo runalexdb https://github.com/redlemonbe/RunAlexDB/releases/latest/download/runalexdb-x86_64-linux-gnu
-chmod +x runalexdb && sudo mv runalexdb /usr/local/bin/
-
-# Run with defaults (MySQL port 3306, admin UI port 8306)
+# Run with defaults — MySQL port 3306, admin UI port 8306
 runalexdb
 
 # Connect with any MySQL client
 mysql -h 127.0.0.1 -u root -pchangeme --skip-ssl
 
-# Admin UI
-open http://localhost:8306
+# Admin UI — http://localhost:8306
 ```
+
+---
+
+## Dashboard (Admin UI)
+
+RunAlexDB embeds the admin UI — no phpMyAdmin, no separate process. Open `http://YOUR_SERVER:8306`.
+
+Enter your API key (from the config file) and click **Sign in**.
+
+Features:
+- **Dashboard** — query rate, active connections, database list
+- **SQL Console** — run any SQL directly in the browser
+- **Databases** — create, list, drop databases
+- **Tables** — browse schema and row data
+- **Users** — virtual user management, password reset
+- **Settings** — live configuration display
 
 ---
 
@@ -55,17 +92,10 @@ root_password = "your-strong-password"
 webui_api_key = "your-admin-api-key"
 
 [xdp]
-enabled         = true
-interface       = "eth0"
+enabled          = true
+interface        = "eth0"
 max_conn_per_sec = 100
 ```
-
----
-
-## Compatibility
-
-RunAlexDB implements the MySQL 4.1 wire protocol.  
-Works with: `mysql` CLI, MariaDB CLI, Python `mysql-connector`, PHP `PDO_MYSQL`, Node `mysql2`, Go `go-sql-driver`, `JDBC`, DBeaver, HeidiSQL, TablePlus, Adminer.
 
 ---
 
@@ -77,15 +107,33 @@ Works with: `mysql` CLI, MariaDB CLI, Python `mysql-connector`, PHP `PDO_MYSQL`,
 │  SYN flood · IP ban · per-IP rate limit              │
 ├──────────────────────────────────────────────────────┤
 │ MySQL wire protocol (Rust / tokio)                   │
-│  Handshake · Auth (native_password) · COM_* dispatch │
+│  Handshake · native_password auth · COM_* dispatch   │
 ├──────────────────────────────────────────────────────┤
 │ SQL engine (Rust)                                    │
-│  sqlparser · B-Tree storage · MVCC · WAL             │
+│  SIMD parser · in-memory storage · WAL (roadmap)     │
 ├──────────────────────────────────────────────────────┤
 │ Admin web UI (port 8306)                             │
 │  SQL console · DB browser · user management          │
 └──────────────────────────────────────────────────────┘
 ```
+
+---
+
+## SQL coverage
+
+Current:
+- `CREATE DATABASE`, `DROP DATABASE`
+- `CREATE TABLE`, `DROP TABLE`
+- `INSERT INTO ... VALUES`
+- `SELECT * FROM table`, `SELECT expr` (no FROM)
+- `SHOW DATABASES`, `SHOW TABLES`
+- `USE db`
+
+Roadmap (see [GitHub Issues](https://github.com/redlemonbe/RunAlexDB/issues)):
+- WHERE / JOIN / UPDATE / DELETE
+- WAL + B-Tree persistence
+- TLS for client connections
+- Master/slave replication
 
 ---
 
@@ -102,16 +150,28 @@ Requires Rust 1.75+.
 
 ---
 
-## Contributing
+## Documentation
 
-`cargo clippy --all-targets` — zero warnings  
-`cargo test` — all tests must pass
+Full index: [docs/index.md](docs/index.md)
+
+Quick links: [Configuration](docs/configuration.md) · [SQL Reference](docs/sql.md) · [API Reference](docs/api.md) · [Security Audit](docs/security-audit.md)
 
 ---
 
-## Support
+## Contributing
 
-[![Sponsor](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor)](https://github.com/sponsors/redlemonbe)
+```bash
+cargo clippy --all-targets   # zero warnings
+cargo test                   # all tests must pass
+```
+
+Pull requests welcome.
+
+---
+
+## Support the project
+
+[![GitHub Sponsors](https://img.shields.io/github/sponsors/redlemonbe?style=flat&logo=github&label=Sponsor%20on%20GitHub)](https://github.com/sponsors/redlemonbe)
 
 **Bitcoin** — `3FP8hkkiu4kwCD1PDFgAv2oq1ZTyXwy3yy`  
 **Ethereum** — `0xB5eEAf89edA4204Aa9305B068b37A93439cBb680`
@@ -122,10 +182,9 @@ Security issues: redlemonbe@codix.be (private disclosure before opening a public
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE)
+AGPL-3.0-only — see [LICENSE](LICENSE). Commercial license available for organizations that need to deploy without AGPL obligations: [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
 
-Any use of RunAlexDB as part of a network service requires making the full source code
-available to users of that service, under the same license.
+---
 
-*Part of the RunSoftware stack — [RunNginx](https://github.com/redlemonbe/RunNginx) · [Runbound](https://github.com/redlemonbe/Runbound) · [dnsmark](https://github.com/redlemonbe/dnsmark) · [httpmark](https://github.com/redlemonbe/httpmark)*  
+*Part of the [RunSoftware](https://github.com/redlemonbe) stack — [Runbound](https://github.com/redlemonbe/Runbound) · [RunNginx](https://github.com/redlemonbe/RunNginx) · [dbmark](https://github.com/redlemonbe/dbmark)*  
 Copyright (C) 2026 RedLemonBe
