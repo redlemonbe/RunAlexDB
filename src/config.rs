@@ -53,6 +53,10 @@ pub struct AuthConfig {
     pub root_password: String,
     #[serde(default = "default_webui_key")]
     pub webui_api_key: String,
+    #[serde(default = "default_webui_admin_user")]
+    pub webui_admin_user: String,
+    #[serde(default = "default_webui_admin_password")]
+    pub webui_admin_password: String,
 }
 
 impl Default for AuthConfig {
@@ -60,6 +64,8 @@ impl Default for AuthConfig {
         Self {
             root_password: default_root_password(),
             webui_api_key: default_webui_key(),
+            webui_admin_user: default_webui_admin_user(),
+            webui_admin_password: default_webui_admin_password(),
         }
     }
 }
@@ -76,6 +82,8 @@ fn default_webui_port() -> u16 { 8306 }
 fn default_bind() -> String { "0.0.0.0".into() }
 fn default_data_dir() -> String { "/var/lib/runalexdb".into() }
 fn default_root_password() -> String { "changeme".into() }
+fn default_webui_admin_user() -> String { "admin".into() }
+fn default_webui_admin_password() -> String { "admin".into() }
 fn default_webui_key() -> String { "changeme".into() }
 fn default_fw_manage() -> bool { true }
 fn default_fw_tag() -> String { "runalexdb".into() }

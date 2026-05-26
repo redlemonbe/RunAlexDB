@@ -1,5 +1,6 @@
 //! In-memory SQL engine — tables, rows, query dispatch.
 
+use subtle::ConstantTimeEq;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock, OnceLock};
 use dashmap::DashMap;
@@ -1206,6 +1207,7 @@ fn _check_result(_: Result<()>) {}
 
 fn double_sha1(data: &[u8]) -> Vec<u8> {
     use sha1::{Digest, Sha1};
+use subtle::ConstantTimeEq;
     let h1 = Sha1::digest(data);
     Sha1::digest(&h1).to_vec()
 }
@@ -1412,6 +1414,21 @@ impl Engine {
     pub fn lookup_user(&self, username: &str) -> Option<(Vec<u8>, bool)> {
         let users = self.users.read().unwrap_or_else(|e| e.into_inner());
         users.get(username).map(|u| (u.password_sha1_sha1.clone(), u.is_root))
+    }
+
+    /// Validate a webui login against the MySQL users table (double-SHA1 comparison).
+    pub fn verify_webui_password(&self, username: &str, password: &str) -> bool {
+        use sha1::{Digest, Sha1};
+        let h1 = Sha1::digest(password.as_bytes());
+        let computed = Sha1::digest(&h1).to_vec();
+        let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(user) = users.get(username) {
+            return bool::from(user.password_sha1_sha1.as_slice().ct_eq(&computed));
+        }
+        // Constant-time: compare with dummy to avoid user enumeration via timing
+        let dummy = vec![0u8; computed.len()];
+        let _ = bool::from(dummy.as_slice().ct_eq(&computed));
+        false
     }
 
     /// Check if a user has access to a given database.

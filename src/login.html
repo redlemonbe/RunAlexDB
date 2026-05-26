@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>RunAlexDB — Login</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#0d1117;--surface:#161b22;--border:#30363d;--text:#e6edf3;--muted:#8b949e;--accent:#58a6ff;--red:#f85149}
+body{background:var(--bg);color:var(--text);font:14px/1.5 'Segoe UI',system-ui,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:40px;width:360px}
+.logo{display:flex;align-items:center;gap:12px;margin-bottom:24px}
+.logo-icon{width:40px;height:40px;background:linear-gradient(135deg,#58a6ff,#bc8cff);border-radius:10px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:18px;color:#000}
+.logo-text{font-weight:700;font-size:18px}
+.logo-sub{font-size:12px;color:var(--muted)}
+.row{margin-bottom:16px}
+label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+input{width:100%;background:#21262d;border:1px solid var(--border);border-radius:6px;color:var(--text);padding:9px 12px;font-size:14px;outline:none;transition:border-color .15s}
+input:focus{border-color:var(--accent)}
+.btn{width:100%;padding:10px;background:var(--accent);color:#000;border:none;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;margin-top:8px;transition:opacity .15s}
+.btn:hover{opacity:.85}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.err{color:var(--red);font-size:12px;margin-top:10px;text-align:center;min-height:18px}
+.footer{text-align:center;margin-top:20px;font-size:11px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">
+    <div class="logo-icon">R</div>
+    <div>
+      <div class="logo-text">RunAlexDB</div>
+      <div class="logo-sub">Admin Console</div>
+    </div>
+  </div>
+  <form id="form" onsubmit="doLogin(event)">
+    <div class="row">
+      <label>Username</label>
+      <input type="text" id="user" autocomplete="username" placeholder="admin" autofocus>
+    </div>
+    <div class="row">
+      <label>Password</label>
+      <input type="password" id="pass" autocomplete="current-password" placeholder="••••••••">
+    </div>
+    <button class="btn" id="btn" type="submit">Sign in</button>
+    <div class="err" id="err"></div>
+  </form>
+  <div class="footer">RunAlexDB Admin &mdash; Authorized access only</div>
+</div>
+<script>
+async function doLogin(e) {
+  e.preventDefault();
+  const btn = document.getElementById('btn');
+  const err = document.getElementById('err');
+  btn.disabled = true;
+  btn.textContent = 'Signing in…';
+  err.textContent = '';
+  try {
+    const r = await fetch('/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('user').value,
+        password: document.getElementById('pass').value
+      })
+    });
+    const j = await r.json();
+    if (r.ok && j.ok) {
+      window.location.href = '/ui';
+    } else {
+      err.textContent = j.error || 'Invalid credentials';
+      btn.disabled = false;
+      btn.textContent = 'Sign in';
+    }
+  } catch {
+    err.textContent = 'Network error';
+    btn.disabled = false;
+    btn.textContent = 'Sign in';
+  }
+}
+</script>
+</body>
+</html>
