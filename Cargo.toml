@@ -1,6 +1,6 @@
 [package]
 name        = "runalexdb"
-version     = "0.2.3"
+version     = "0.3.0"
 edition     = "2021"
 description = "High-performance SQL database — MySQL/MariaDB wire protocol, XDP fast-path, SIMD query engine"
 license     = "AGPL-3.0-only"
@@ -36,6 +36,10 @@ rustls       = { version = "0.23", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rcgen        = { version = "0.13", optional = true }
+
+# Concurrent data structures
+dashmap      = "6"
+parking_lot  = "0.12"
 
 # Error handling
 anyhow       = "1"

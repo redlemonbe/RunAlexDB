@@ -188,6 +188,7 @@ fn api_query(db: &Engine, body: &str) -> String {
             format!(r#"{{"columns":[{}],"rows":[{}]}}"#,
                 cols_json.join(","), rows_json.join(","))
         }
+        QueryResult::ValueRows { .. } => "{}".to_owned(),
     }
 }
 

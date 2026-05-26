@@ -1,17 +1,44 @@
 //! In-memory SQL engine — tables, rows, query dispatch.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, OnceLock};
+use dashmap::DashMap;
 
 use anyhow::{bail, Result};
 use sqlparser::ast::{
     Assignment, BinaryOperator, ColumnDef, Expr, ObjectName,
     Query, SelectItem, SetExpr, Statement, UnaryOperator, Values,
 };
-use sqlparser::dialect::MySqlDialect;
-use sqlparser::parser::Parser;
 
 use crate::config::Config;
+
+// ── Query statement cache (avoids repeated sqlparser parsing) ─────────────
+// Key: CRC32 hash of the SQL string. Value: cloned AST Arc.
+static STMT_CACHE: OnceLock<DashMap<u64, Arc<Vec<Statement>>>> = OnceLock::new();
+
+#[inline]
+fn stmt_cache() -> &'static DashMap<u64, Arc<Vec<Statement>>> {
+    STMT_CACHE.get_or_init(|| DashMap::with_capacity(4096))
+}
+
+fn parse_cached(sql: &str) -> Result<Arc<Vec<Statement>>, String> {
+    let key = crate::simd_scan::hash_query(sql.as_bytes());
+    if let Some(r) = stmt_cache().get(&key) {
+        return Ok(Arc::clone(r.value()));
+    }
+    let dialect = sqlparser::dialect::MySqlDialect {};
+    match sqlparser::parser::Parser::parse_sql(&dialect, sql) {
+        Ok(stmts) => {
+            let arc = Arc::new(stmts);
+            if stmt_cache().len() > 8192 { stmt_cache().clear(); }
+            stmt_cache().insert(key, Arc::clone(&arc));
+            Ok(arc)
+        }
+        Err(e) => Err(format!("Parse error: {e}")),
+    }
+}
+
+
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -81,6 +108,13 @@ pub struct Table {
     pub schema: String,
     pub columns: Vec<Column>,
     pub rows: Vec<Row>,
+    /// Index of the PRIMARY KEY column, if any.
+    pub pk_col_idx: Option<usize>,
+    /// Maps pk_value (as String) → row index in `rows`. O(1) PK lookups.
+    pub pk_index: HashMap<String, usize>,
+    /// Column-oriented int64 store for AVX2 scans.
+    /// col_int_data[col_idx] = Some(vec) for Int/BigInt columns, None otherwise.
+    pub col_int_data: Vec<Option<Vec<i64>>>,
     pub next_auto: i64,
 }
 
@@ -191,6 +225,11 @@ impl Engine {
                 return QueryResult::rows(vec!["Tables"], rows);
             }
             return QueryResult::ok(0, 0);
+        }
+
+        // MySQL system variables — SELECT @@var or SELECT @@session.var
+        if sql_upper.starts_with("SELECT @@") {
+            return self.exec_select_sysvar(sql.trim());
         }
 
         // SET statements (ignored — just return OK)
@@ -305,16 +344,14 @@ impl Engine {
             );
         }
 
-        // Parse with sqlparser
-        let dialect = MySqlDialect {};
-        let stmts = match Parser::parse_sql(&dialect, sql) {
+        // Parse with sqlparser (AST cached by CRC32 key — avoids re-parse on hot queries)
+        let stmts = match parse_cached(sql) {
             Ok(s) => s,
-            Err(e) => return QueryResult::err(1064, &format!("Parse error: {e}")),
+            Err(e) => return QueryResult::err(1064, &e),
         };
-
         let mut last = QueryResult::ok(0, 0);
-        for stmt in stmts {
-            last = self.exec_stmt(stmt, current_db);
+        for stmt in stmts.iter() {
+            last = self.exec_stmt(stmt.clone(), current_db);
         }
         last
     }
@@ -396,11 +433,15 @@ impl Engine {
 
         let columns: Vec<Column> = col_defs.iter().map(|c| {
             let col_type = sql_type_to_col_type(&c.data_type);
+            let is_pk = c.options.iter().any(|o| matches!(
+                &o.option,
+                sqlparser::ast::ColumnOption::Unique { is_primary: true, .. }
+            ));
             Column {
                 name: c.name.value.clone(),
                 col_type,
-                nullable: true,
-                primary_key: false,
+                nullable: !is_pk,
+                primary_key: is_pk,
             }
         }).collect();
 
@@ -410,11 +451,22 @@ impl Engine {
             if if_not_exists && db.tables.contains_key(&table_name) {
                 return QueryResult::ok(0, 0);
             }
+            let pk_col_idx = columns.iter().position(|c| c.primary_key);
+            let n_cols = columns.len();
+            let col_int_data: Vec<Option<Vec<i64>>> = columns.iter().map(|c| {
+                match c.col_type {
+                    ColumnType::Int | ColumnType::BigInt => Some(Vec::new()),
+                    _ => None,
+                }
+            }).collect();
             db.tables.insert(table_name.clone(), Table {
                 name: table_name,
                 schema: db_name.to_string(),
                 columns,
                 rows: vec![],
+                pk_col_idx,
+                pk_index: HashMap::new(),
+                col_int_data,
                 next_auto: 1,
             });
             QueryResult::ok(0, 0)
@@ -456,6 +508,21 @@ impl Engine {
         let count = rows.len() as u64;
         for row_exprs in rows {
             let row: Row = row_exprs.into_iter().map(expr_to_value).collect();
+            // Maintain PK index
+            if let Some(pk_idx) = table.pk_col_idx {
+                let pk_key = row_pk_key(&row, pk_idx);
+                table.pk_index.insert(pk_key, table.rows.len());
+            }
+            // Maintain column-oriented int store (for AVX2 scans)
+            for (ci, store) in table.col_int_data.iter_mut().enumerate() {
+                if let Some(ref mut v) = store {
+                    let val = match row.get(ci) {
+                        Some(Value::Int(n)) => *n,
+                        _ => 0,
+                    };
+                    v.push(val);
+                }
+            }
             table.rows.push(row);
         }
         QueryResult::ok(count, 0)
@@ -523,7 +590,7 @@ impl Engine {
                 };
                 let fname = func.name.to_string().to_uppercase();
                 match fname.as_str() {
-                    "COUNT" => Some(filtered.len().to_string()),
+                    "COUNT" => Some(filtered.len().to_string()), // O(1) since filtered is already built
                     "MAX" => {
                         let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
@@ -589,11 +656,63 @@ impl Engine {
 
         let col_names: Vec<String> = proj_cols.iter().map(|(n, _)| n.clone()).collect();
 
-        // Filter by WHERE
-        let mut result_rows: Vec<Vec<Option<String>>> = table.rows.iter()
-            .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
-            .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
-            .collect();
+        // Fast path: PK equality (O(1) lookup via HashMap index)
+        if let (Some(pk_idx), Some(ref where_expr)) = (table.pk_col_idx, &sel.selection) {
+            let pk_col_name = &table.columns[pk_idx].name.clone();
+            if let Some(pk_val) = extract_pk_eq(pk_col_name, where_expr) {
+                let result_rows: Vec<Vec<Option<String>>> =
+                    if let Some(&ri) = table.pk_index.get(&pk_val) {
+                        if ri < table.rows.len() {
+                            let row = &table.rows[ri];
+                            vec![proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect()]
+                        } else { vec![] }
+                    } else { vec![] };
+                return QueryResult::rows(col_names, result_rows);
+            }
+        }
+
+        // Fast path: SIMD column scan for int WHERE (AVX2 4-wide i64 comparison)
+        let simd_indices: Option<Vec<usize>> =
+            if let Some(ref where_expr) = sel.selection {
+                try_simd_scan(&table, where_expr)
+            } else { None };
+
+        // ValueRows fast path: no ORDER BY or LIMIT → return Values directly.
+        // Protocol layer encodes Int as ASCII on stack — zero heap allocation per row.
+        let needs_postprocess = query.order_by.is_some()
+            || query.limit.is_some()
+            || query.offset.is_some();
+        if !needs_postprocess {
+            let value_rows: Vec<Vec<Value>> = if let Some(ref idxs) = simd_indices {
+                idxs.iter()
+                    .filter_map(|&ri| table.rows.get(ri))
+                    .map(|row| proj_cols.iter()
+                        .map(|(_, idx)| row.get(*idx).cloned().unwrap_or(Value::Null))
+                        .collect())
+                    .collect()
+            } else {
+                table.rows.iter()
+                    .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
+                    .map(|row| proj_cols.iter()
+                        .map(|(_, idx)| row.get(*idx).cloned().unwrap_or(Value::Null))
+                        .collect())
+                    .collect()
+            };
+            return QueryResult::value_rows(col_names, value_rows);
+        }
+
+        // Fallback String path (ORDER BY / LIMIT need comparable String values)
+        let mut result_rows: Vec<Vec<Option<String>>> = if let Some(ref idxs) = simd_indices {
+            idxs.iter()
+                .filter_map(|&ri| table.rows.get(ri))
+                .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
+                .collect()
+        } else {
+            table.rows.iter()
+                .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
+                .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
+                .collect()
+        };
 
         // ORDER BY
         if let Some(ob) = &query.order_by {
@@ -664,15 +783,41 @@ impl Engine {
         };
 
         let mut affected = 0u64;
-        for row in table.rows.iter_mut() {
-            if selection.map_or(true, |w| eval_where(row, &table.columns, w)) {
-                for asgn in &assignments {
-                    let col_name = asgn.target.to_string();
-                    if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
-                        row[idx] = expr_to_value(asgn.value.clone());
+        // PK fast path for UPDATE WHERE pk = literal
+        let pk_eq: Option<(usize, String)> = if let (Some(pk_idx), Some(w)) = (table.pk_col_idx, selection) {
+            let pk_name = table.columns[pk_idx].name.clone();
+            extract_pk_eq(&pk_name, w).map(|v| (pk_idx, v))
+        } else { None };
+
+        if let Some((_, ref pk_val)) = pk_eq {
+            if let Some(&ri) = table.pk_index.get(pk_val.as_str()) {
+                if ri < table.rows.len() {
+                    let row = &mut table.rows[ri];
+                    for asgn in &assignments {
+                        let col_name = asgn.target.to_string();
+                        if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                            let new_val = expr_to_value(asgn.value.clone());
+                            // Keep col_int_data in sync
+                            if let (Some(ref mut store), Value::Int(n)) = (table.col_int_data.get_mut(idx).and_then(|x| x.as_mut()), &new_val) {
+                                if ri < store.len() { store[ri] = *n; }
+                            }
+                            row[idx] = new_val;
+                        }
                     }
+                    affected = 1;
                 }
-                affected += 1;
+            }
+        } else {
+            for row in table.rows.iter_mut() {
+                if selection.map_or(true, |w| eval_where(row, &table.columns, w)) {
+                    for asgn in &assignments {
+                        let col_name = asgn.target.to_string();
+                        if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                            row[idx] = expr_to_value(asgn.value.clone());
+                        }
+                    }
+                    affected += 1;
+                }
             }
         }
         QueryResult::ok(affected, 0)
@@ -694,9 +839,41 @@ impl Engine {
         };
 
         let before = table.rows.len();
-        table.rows.retain(|row| {
-            selection.map_or(false, |w| !eval_where(row, &table.columns, w))
-        });
+        // PK fast path for DELETE WHERE pk = literal (O(1) swap_remove)
+        let pk_eq_del: Option<String> = if let (Some(pk_idx), Some(w)) = (table.pk_col_idx, selection) {
+            let pk_name = table.columns[pk_idx].name.clone();
+            extract_pk_eq(&pk_name, w)
+        } else { None };
+
+        if let Some(ref pk_val) = pk_eq_del {
+            if let Some(ri) = table.pk_index.remove(pk_val.as_str()) {
+                if ri < table.rows.len() {
+                    let last_idx = table.rows.len() - 1;
+                    if ri != last_idx {
+                        // Update pk_index for the row that will be swapped in
+                        let moved_pk = row_pk_key(&table.rows[last_idx], table.pk_col_idx.unwrap());
+                        table.pk_index.insert(moved_pk, ri);
+                    }
+                    table.rows.swap_remove(ri);
+                    // Keep col_int_data in sync
+                    for store in table.col_int_data.iter_mut().flatten() {
+                        if ri < store.len() { store.swap_remove(ri); }
+                    }
+                }
+            }
+        } else {
+            table.rows.retain(|row| {
+                selection.map_or(false, |w| !eval_where(row, &table.columns, w))
+            });
+            // Rebuild pk_index after bulk delete (pk_index is only fast-path, not always correct after retain)
+            if table.pk_col_idx.is_some() {
+                table.pk_index.clear();
+                let pk_i = table.pk_col_idx.unwrap();
+                for (ri, row) in table.rows.iter().enumerate() {
+                    table.pk_index.insert(row_pk_key(row, pk_i), ri);
+                }
+            }
+        }
         let affected = (before - table.rows.len()) as u64;
         QueryResult::ok(affected, 0)
     }
@@ -909,6 +1086,9 @@ pub enum QueryResult {
     Ok { affected: u64, last_insert_id: u64 },
     Err { code: u16, message: String },
     Rows { columns: Vec<String>, rows: Vec<Vec<Option<String>>> },
+    /// Zero-copy: Values encoded in protocol layer without String conversion.
+    /// Int values → ASCII on stack buffer, Text → direct slice. No heap per row.
+    ValueRows { columns: Vec<String>, rows: Vec<Vec<Value>> },
 }
 
 impl QueryResult {
@@ -923,6 +1103,9 @@ impl QueryResult {
             columns: cols.into_iter().map(|c| c.into()).collect(),
             rows: rows.into_iter().map(|r| r.into_iter().map(|v| v.map(|s| s.into())).collect()).collect(),
         }
+    }
+    pub fn value_rows(cols: Vec<String>, rows: Vec<Vec<Value>>) -> Self {
+        Self::ValueRows { columns: cols, rows }
     }
 }
 
@@ -1195,6 +1378,62 @@ impl Engine {
     }
 }
 
+impl Engine {
+    fn exec_select_sysvar(&self, sql: &str) -> QueryResult {
+        // Extract variable names from SELECT @@var1, @@var2 [AS alias]
+        // Supports: @@max_allowed_packet, @@character_set_*, @@collation_*, etc.
+        fn sysvar_value(name: &str) -> Option<String> {
+            match name.to_lowercase().trim_start_matches('@').trim_start_matches("session.").trim_start_matches("global.") {
+                "max_allowed_packet"          => Some("67108864".into()),
+                "character_set_client"        => Some("utf8mb4".into()),
+                "character_set_connection"    => Some("utf8mb4".into()),
+                "character_set_results"       => Some("utf8mb4".into()),
+                "character_set_server"        => Some("utf8mb4".into()),
+                "collation_connection"        => Some("utf8mb4_general_ci".into()),
+                "collation_server"            => Some("utf8mb4_general_ci".into()),
+                "time_zone"                   => Some("UTC".into()),
+                "sql_mode"                    => Some("STRICT_TRANS_TABLES".into()),
+                "auto_increment_increment"    => Some("1".into()),
+                "transaction_isolation"       => Some("REPEATABLE-READ".into()),
+                "tx_isolation"                => Some("REPEATABLE-READ".into()),
+                "lower_case_table_names"      => Some("0".into()),
+                "version"                     => Some("8.0.32-RunAlexDB".into()),
+                "version_comment"             => Some("RunAlexDB".into()),
+                "wait_timeout"               => Some("28800".into()),
+                "interactive_timeout"         => Some("28800".into()),
+                "net_write_timeout"           => Some("60".into()),
+                "net_read_timeout"            => Some("30".into()),
+                "init_connect"                => Some("".into()),
+                _                             => None,
+            }
+        }
+
+        // Extract everything after SELECT
+        let after_select = if let Some(pos) = sql.to_uppercase().find("SELECT ") {
+            &sql[pos + 7..]
+        } else { sql };
+
+        // Split on comma, handle AS aliases
+        let mut col_names = Vec::new();
+        let mut row = Vec::new();
+        for part in after_select.split(',') {
+            let part = part.trim();
+            let (var_part, alias) = if let Some(idx) = part.to_uppercase().find(" AS ") {
+                let v = part[..idx].trim();
+                let a = part[idx+4..].trim().trim_matches('`').trim_matches('\'');
+                (v, a.to_owned())
+            } else {
+                (part, part.trim_matches('`').to_owned())
+            };
+            let val = sysvar_value(var_part.trim()).unwrap_or_else(|| var_part.trim().to_owned());
+            col_names.push(alias);
+            row.push(Some(val));
+        }
+        QueryResult::rows(col_names.iter().map(|s| s.as_str()).collect(), vec![row])
+    }
+}
+
+
 // ── Parse helpers ─────────────────────────────────────────────────────────
 
 /// Parse `'username'@'host' [IDENTIFIED BY 'password']`
@@ -1238,4 +1477,411 @@ fn parse_user_ident_with_password(s: &str) -> (String, String) {
     };
 
     (username, password)
+}
+
+impl Engine {
+    /// Execute a prepared statement SQL (with ? placeholders) using bound parameters.
+    /// The SQL with ? is used as the cache key — parse happens only once per statement.
+    pub fn execute_prepared(&self, sql: &str, params: &[Option<String>], current_db: &Option<String>) -> QueryResult {
+        let bound: Vec<Value> = params.iter().map(|p| match p {
+            None => Value::Null,
+            Some(s) => match s.parse::<i64>() {
+                Ok(n) => Value::Int(n),
+                Err(_) => match s.parse::<f64>() {
+                    Ok(f) => Value::Float(f),
+                    Err(_) => Value::Text(s.clone()),
+                },
+            },
+        }).collect();
+
+        let stmts = match parse_cached(sql) {
+            Ok(s) => s,
+            Err(e) => return QueryResult::err(1064, &e),
+        };
+        let mut last = QueryResult::ok(0, 0);
+        for stmt in stmts.iter() {
+            last = self.exec_stmt_prepared(stmt.clone(), &bound, current_db);
+        }
+        last
+    }
+
+    fn exec_stmt_prepared(&self, stmt: Statement, bound: &[Value], current_db: &Option<String>) -> QueryResult {
+        match stmt {
+            Statement::Query(q) => {
+                let db_name = current_db.as_deref().unwrap_or("test");
+                self.select_prepared(db_name, *q, bound)
+            }
+            Statement::Insert(insert) => {
+                let db_name = current_db.as_deref().unwrap_or("test");
+                self.insert_prepared(db_name, &insert.table.to_string(), insert.source, bound)
+            }
+            Statement::Update { table, assignments, selection, .. } => {
+                let db_name = current_db.as_deref().unwrap_or("test");
+                self.update_prepared(db_name, &table.relation.to_string(), assignments, selection.as_ref(), bound)
+            }
+            Statement::Delete(del) => {
+                let db_name = current_db.as_deref().unwrap_or("test");
+                let table_name = match &del.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(t)
+                    | sqlparser::ast::FromTable::WithoutKeyword(t) => {
+                        t.first().map(|x| x.relation.to_string()).unwrap_or_default()
+                    }
+                };
+                self.delete_prepared(db_name, &table_name, del.selection.as_ref(), bound)
+            }
+            other => self.exec_stmt(other, current_db),
+        }
+    }
+
+    fn select_prepared(&self, db_name: &str, query: Query, bound: &[Value]) -> QueryResult {
+        let SetExpr::Select(sel) = *query.body else {
+            return QueryResult::err(1295, "Complex SELECT not supported");
+        };
+        if sel.from.is_empty() { return QueryResult::err(1295, "No FROM"); }
+
+        let raw = sel.from[0].relation.to_string();
+        let (sel_db, tname) = if let Some(d) = raw.find('.') {
+            (raw[..d].trim_matches('`').to_owned(), raw[d+1..].trim_matches('`').to_owned())
+        } else { (db_name.to_owned(), raw.trim_matches('`').to_owned()) };
+
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let Some(db_arc) = dbs.get(&sel_db) else {
+            return QueryResult::err(1049, &format!("Unknown database '{sel_db}'"));
+        };
+        let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+        let Some(table) = db.tables.get(&tname) else {
+            return QueryResult::err(1146, &format!("Table not found: {tname}"));
+        };
+
+        // Column projection
+        let proj_cols: Vec<(String, usize)> =
+            if sel.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))) {
+                table.columns.iter().enumerate().map(|(i, c)| (c.name.clone(), i)).collect()
+            } else {
+                sel.projection.iter().filter_map(|p| {
+                    let col_name = match p {
+                        SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.clone(),
+                        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(ps)) => ps.last()?.value.clone(),
+                        _ => return None,
+                    };
+                    let idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))?;
+                    Some((col_name, idx))
+                }).collect()
+            };
+        let col_names: Vec<String> = proj_cols.iter().map(|(n, _)| n.clone()).collect();
+
+        // PK fast path: WHERE pk = ? (O(1) lookup)
+        if let (Some(pk_idx), Some(ref where_expr)) = (table.pk_col_idx, &sel.selection) {
+            let pk_col_name = &table.columns[pk_idx].name.clone();
+            if let Some(param_pos) = extract_pk_eq_param(pk_col_name, where_expr) {
+                if let Some(pk_val) = bound.get(param_pos).map(|v| value_to_pk_str(v)) {
+                    let result_rows: Vec<Vec<Option<String>>> =
+                        if let Some(&ri) = table.pk_index.get(&pk_val) {
+                            if ri < table.rows.len() {
+                                let row = &table.rows[ri];
+                                vec![proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect()]
+                            } else { vec![] }
+                        } else { vec![] };
+                    return QueryResult::rows(col_names, result_rows);
+                }
+            }
+        }
+
+        // Aggregate fast path
+        let is_agg = !sel.projection.is_empty() && sel.projection.iter().all(|p| {
+            matches!(p, SelectItem::UnnamedExpr(Expr::Function(_)) | SelectItem::ExprWithAlias { expr: Expr::Function(_), .. })
+        });
+        if is_agg {
+            // COUNT(*) with no WHERE = table.rows.len()
+            let has_where = sel.selection.is_some();
+            let filtered: Vec<&Row> = if has_where {
+                table.rows.iter()
+                    .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where_bound(r, &table.columns, w, bound)))
+                    .collect()
+            } else {
+                table.rows.iter().collect()
+            };
+            let agg_cols: Vec<String> = sel.projection.iter().map(|p| p.to_string()).collect();
+            let agg_vals: Vec<Option<String>> = sel.projection.iter().map(|p| {
+                let func = match p {
+                    SelectItem::UnnamedExpr(Expr::Function(f)) => f,
+                    SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => f,
+                    _ => return None,
+                };
+                match func.name.to_string().to_uppercase().as_str() {
+                    "COUNT" => Some(filtered.len().to_string()),
+                    _ => None,
+                }
+            }).collect();
+            return QueryResult::rows(agg_cols, vec![agg_vals]);
+        }
+
+        // General filter
+        let result_rows: Vec<Vec<Option<String>>> = table.rows.iter()
+            .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where_bound(r, &table.columns, w, bound)))
+            .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
+            .collect();
+        QueryResult::rows(col_names, result_rows)
+    }
+
+    fn insert_prepared(&self, db_name: &str, table_name: &str, source: Option<Box<Query>>, bound: &[Value]) -> QueryResult {
+        let Some(source) = source else { return QueryResult::err(1064, "INSERT without VALUES"); };
+        let SetExpr::Values(Values { rows, .. }) = *source.body else {
+            return QueryResult::err(1064, "Only VALUES inserts supported");
+        };
+        let (eff_db, eff_table) = if let Some(dot) = table_name.find('.') {
+            (table_name[..dot].trim_matches('`').to_owned(), table_name[dot+1..].trim_matches('`').to_owned())
+        } else { (db_name.to_owned(), table_name.trim_matches('`').to_owned()) };
+
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+        let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+        let Some(table) = db.tables.get_mut(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+
+        let count = rows.len() as u64;
+        let mut param_idx = 0usize;
+        for row_exprs in rows {
+            let row: Row = row_exprs.into_iter().map(|e| {
+                if matches!(e, Expr::Value(ref vs) if vs.value.to_string() == "?") {
+                    let v = bound.get(param_idx).cloned().unwrap_or(Value::Null);
+                    param_idx += 1;
+                    v
+                } else {
+                    expr_to_value(e)
+                }
+            }).collect();
+            if let Some(pk_idx) = table.pk_col_idx {
+                let pk_key = row_pk_key(&row, pk_idx);
+                table.pk_index.insert(pk_key, table.rows.len());
+            }
+            for (ci, store) in table.col_int_data.iter_mut().enumerate() {
+                if let Some(ref mut v) = store {
+                    v.push(match row.get(ci) { Some(Value::Int(n)) => *n, _ => 0 });
+                }
+            }
+            table.rows.push(row);
+        }
+        QueryResult::ok(count, 0)
+    }
+
+    fn update_prepared(&self, db_name: &str, table_name: &str, assignments: Vec<Assignment>, selection: Option<&Expr>, bound: &[Value]) -> QueryResult {
+        let (eff_db, eff_table) = if let Some(dot) = table_name.find('.') {
+            (table_name[..dot].trim_matches('`').to_owned(), table_name[dot+1..].trim_matches('`').to_owned())
+        } else { (db_name.to_owned(), table_name.trim_matches('`').to_owned()) };
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+        let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+        let Some(table) = db.tables.get_mut(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+
+        // PK fast path for UPDATE WHERE pk = ?
+        if let (Some(pk_idx), Some(w)) = (table.pk_col_idx, selection) {
+            let pk_col_name = table.columns[pk_idx].name.clone();
+            if let Some(param_pos) = extract_pk_eq_param(&pk_col_name, w) {
+                if let Some(pk_val) = bound.get(param_pos).map(|v| value_to_pk_str(v)) {
+                    if let Some(&ri) = table.pk_index.get(&pk_val) {
+                        if ri < table.rows.len() {
+                            // Resolve assignment bound params
+                            let mut asgn_param = 0usize;
+                            for asgn in &assignments {
+                                let col_name = asgn.target.to_string();
+                                if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                                    let new_val = if matches!(asgn.value, Expr::Value(ref vs) if vs.value.to_string() == "?") {
+                                        let v = bound.get(asgn_param).cloned().unwrap_or(Value::Null);
+                                        asgn_param += 1;
+                                        v
+                                    } else { expr_to_value(asgn.value.clone()) };
+                                    if let (Some(store), Value::Int(n)) = (table.col_int_data.get_mut(idx).and_then(|x| x.as_mut()), &new_val) {
+                                        if ri < store.len() { store[ri] = *n; }
+                                    }
+                                    table.rows[ri][idx] = new_val;
+                                }
+                            }
+                        }
+                    }
+                    return QueryResult::ok(1, 0);
+                }
+            }
+        }
+        // General path
+        let mut affected = 0u64;
+        for row in table.rows.iter_mut() {
+            if selection.map_or(true, |w| eval_where_bound(row, &table.columns, w, bound)) {
+                for asgn in &assignments {
+                    let col_name = asgn.target.to_string();
+                    if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                        row[idx] = expr_to_value(asgn.value.clone());
+                    }
+                }
+                affected += 1;
+            }
+        }
+        QueryResult::ok(affected, 0)
+    }
+
+    fn delete_prepared(&self, db_name: &str, table_name: &str, selection: Option<&Expr>, bound: &[Value]) -> QueryResult {
+        let (eff_db, eff_table) = if let Some(dot) = table_name.find('.') {
+            (table_name[..dot].trim_matches('`').to_owned(), table_name[dot+1..].trim_matches('`').to_owned())
+        } else { (db_name.to_owned(), table_name.trim_matches('`').to_owned()) };
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+        let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+        let Some(table) = db.tables.get_mut(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+        let before = table.rows.len();
+        table.rows.retain(|row| selection.map_or(false, |w| !eval_where_bound(row, &table.columns, w, bound)));
+        QueryResult::ok((before - table.rows.len()) as u64, 0)
+    }
+
+} // impl Engine (prepared stmt methods)
+
+// ── Helper functions for PK index and SIMD dispatch ──────────────────────
+
+/// Extract the PK value as a canonical string for use in pk_index.
+fn row_pk_key(row: &Row, pk_col_idx: usize) -> String {
+    match row.get(pk_col_idx) {
+        Some(Value::Int(n))  => n.to_string(),
+        Some(Value::Text(s)) => s.clone(),
+        Some(v) => v.to_display().unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// Detect `WHERE pk_col = literal` pattern and return the literal as a String.
+/// Supports both `col = val` and `val = col` forms.
+fn extract_pk_eq(pk_col_name: &str, expr: &Expr) -> Option<String> {
+    let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr else { return None };
+    // Identify which side is the column and which is the literal
+    let (col_expr, val_expr) = {
+        let left_is_col = matches!(left.as_ref(),
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+        if left_is_col { (left.as_ref(), right.as_ref()) }
+        else            { (right.as_ref(), left.as_ref()) }
+    };
+    let col_name = match col_expr {
+        Expr::Identifier(id) => id.value.as_str(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
+        _ => return None,
+    };
+    if !col_name.eq_ignore_ascii_case(pk_col_name) { return None; }
+    match val_expr {
+        Expr::Value(vs) => match &vs.value {
+            sqlparser::ast::Value::Number(n, _) => Some(n.clone()),
+            sqlparser::ast::Value::SingleQuotedString(s) => Some(s.clone()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Try to accelerate a WHERE clause using the SIMD column store.
+/// Returns Some(matching_indices) if a SIMD path was applicable, None otherwise.
+fn try_simd_scan(table: &Table, expr: &Expr) -> Option<Vec<usize>> {
+    let Expr::BinaryOp { left, op, right } = expr else { return None };
+    // Only handle col OP literal patterns on Int columns
+    let col_name = match left.as_ref() {
+        Expr::Identifier(id) => id.value.as_str(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
+        _ => return None,
+    };
+    let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+    let store = table.col_int_data.get(col_idx)?.as_ref()?;
+    let target: i64 = match right.as_ref() {
+        Expr::Value(vs) => match &vs.value {
+            sqlparser::ast::Value::Number(n, _) => n.parse().ok()?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let indices = match op {
+        BinaryOperator::Eq => crate::simd_scan::scan_eq_i64(store, target),
+        BinaryOperator::Gt => crate::simd_scan::scan_gt_i64(store, target),
+        BinaryOperator::Lt => crate::simd_scan::scan_lt_i64(store, target),
+        _ => return None,
+    };
+    Some(indices)
+}
+
+/// Convert a bound Value to the string key used in pk_index.
+fn value_to_pk_str(v: &Value) -> String {
+    match v {
+        Value::Int(n)   => n.to_string(),
+        Value::Float(f) => f.to_string(),
+        Value::Text(s)  => s.clone(),
+        Value::Null     => String::new(),
+        Value::Bytes(_) => String::new(),
+    }
+}
+
+/// Detect `WHERE pk_col = ?` pattern and return the bound parameter index.
+fn extract_pk_eq_param(pk_col_name: &str, expr: &Expr) -> Option<usize> {
+    let Expr::BinaryOp { left, op: BinaryOperator::Eq, right } = expr else { return None };
+    let (col_expr, val_expr) = {
+        let left_is_col = matches!(left.as_ref(), Expr::Identifier(_) | Expr::CompoundIdentifier(_));
+        if left_is_col { (left.as_ref(), right.as_ref()) } else { (right.as_ref(), left.as_ref()) }
+    };
+    let col_name = match col_expr {
+        Expr::Identifier(id) => id.value.as_str(),
+        Expr::CompoundIdentifier(parts) => parts.last()?.value.as_str(),
+        _ => return None,
+    };
+    if !col_name.eq_ignore_ascii_case(pk_col_name) { return None; }
+    if matches!(val_expr, Expr::Value(vs) if vs.value.to_string() == "?") { Some(0) } else { None }
+}
+
+/// Evaluate a WHERE clause with bound parameters (? slots resolved from `bound`).
+fn eval_where_bound(row: &Row, cols: &[Column], expr: &Expr, bound: &[Value]) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinaryOperator::And => eval_where_bound(row, cols, left, bound) && eval_where_bound(row, cols, right, bound),
+                BinaryOperator::Or  => eval_where_bound(row, cols, left, bound) || eval_where_bound(row, cols, right, bound),
+                _ => {
+                    let lv = resolve_expr_bound(row, cols, left, bound);
+                    let rv = resolve_expr_bound(row, cols, right, bound);
+                    match op {
+                        BinaryOperator::Eq    => values_eq(&lv, &rv),
+                        BinaryOperator::NotEq => !values_eq(&lv, &rv),
+                        BinaryOperator::Lt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Less,
+                        BinaryOperator::LtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Greater,
+                        BinaryOperator::Gt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Greater,
+                        BinaryOperator::GtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Less,
+                        _ => true,
+                    }
+                }
+            }
+        }
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => !eval_where_bound(row, cols, expr, bound),
+        Expr::IsNull(e)    => matches!(resolve_expr_bound(row, cols, e, bound), Value::Null),
+        Expr::IsNotNull(e) => !matches!(resolve_expr_bound(row, cols, e, bound), Value::Null),
+        Expr::Nested(inner) => eval_where_bound(row, cols, inner, bound),
+        other => eval_where(row, cols, other),
+    }
+}
+
+fn resolve_expr_bound(row: &Row, cols: &[Column], expr: &Expr, bound: &[Value]) -> Value {
+    if matches!(expr, Expr::Value(vs) if vs.value.to_string() == "?") {
+        return bound.first().cloned().unwrap_or(Value::Null);
+    }
+    match expr {
+        Expr::Identifier(id) => {
+            if let Some(idx) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&id.value)) {
+                row.get(idx).cloned().unwrap_or(Value::Null)
+            } else { Value::Null }
+        }
+        Expr::Value(vs) => value_from_sqlparser(&vs.value),
+        _ => Value::Null,
+    }
+}
+
+fn value_from_sqlparser(v: &sqlparser::ast::Value) -> Value {
+    match v {
+        sqlparser::ast::Value::Number(n, _) => {
+            if let Ok(i) = n.parse::<i64>() { Value::Int(i) }
+            else if let Ok(f) = n.parse::<f64>() { Value::Float(f) }
+            else { Value::Text(n.clone()) }
+        }
+        sqlparser::ast::Value::SingleQuotedString(s)
+        | sqlparser::ast::Value::DoubleQuotedString(s) => Value::Text(s.clone()),
+        sqlparser::ast::Value::Null => Value::Null,
+        _ => Value::Null,
+    }
 }

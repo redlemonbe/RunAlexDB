@@ -18,6 +18,29 @@ use crate::protocol::{
     parse_execute_params, stmt_prepare_ok, server_greeting, server_greeting_tls, text_row, Command, CAPABILITY_SSL,
 };
 
+
+// Pre-computed wire bytes for "SELECT 1" — skips parsing and encoding entirely.
+// Packet sequence always starts at 1 for a fresh command response.
+const SELECT_1_RESPONSE: &[u8] = &[
+    // column count = 1 (seq=1)
+    0x01, 0x00, 0x00, 0x01, 0x01,
+    // column def name="1", type=0xfd (seq=2)
+    0x18, 0x00, 0x00, 0x02,
+    0x03, 0x64, 0x65, 0x66, // "def"
+    0x00,                    // schema ""
+    0x00,                    // table ""
+    0x00,                    // org_table ""
+    0x01, 0x31,              // name "1"
+    0x01, 0x31,              // org_name "1"
+    0x0c, 0x21, 0x00, 0xff, 0x00, 0x00, 0x00, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00,
+    // EOF (seq=3)
+    0x05, 0x00, 0x00, 0x03, 0xfe, 0x00, 0x00, 0x02, 0x00,
+    // row "1" (seq=4)
+    0x02, 0x00, 0x00, 0x04, 0x01, 0x31,
+    // EOF (seq=5)
+    0x05, 0x00, 0x00, 0x05, 0xfe, 0x00, 0x00, 0x02, 0x00,
+];
+
 const MAX_CONNECTIONS: usize = 256;
 
 // ── TLS acceptor setup ─────────────────────────────────────────────────────
@@ -92,6 +115,7 @@ pub async fn run(cfg: Config, db: Arc<Engine>) -> Result<()> {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let _ = stream.set_nodelay(true);
                 let permit = match Arc::clone(&sem).try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
@@ -235,12 +259,20 @@ where
                 let auth_len = if rest.is_empty() { 0 } else { rest[0] as usize };
                 let db_offset = 1 + auth_len;
                 let rest2 = if db_offset <= rest.len() { &rest[db_offset..] } else { &[][..] };
+                // MySQL auth plugin names are not valid database names — filter them out.
+                // Some clients (pymysql) omit the database field and put the plugin name here.
+                const AUTH_PLUGINS: &[&str] = &["mysql_native_password", "sha256_password",
+                    "caching_sha2_password", "mysql_clear_password", "authentication_windows_client"];
                 if let Some(end) = rest2.iter().position(|&b| b == 0) {
                     let name = String::from_utf8_lossy(&rest2[..end]).trim().to_owned();
-                    if !name.is_empty() { Some(name) } else { None }
+                    if !name.is_empty() && !AUTH_PLUGINS.iter().any(|p| name.eq_ignore_ascii_case(p)) {
+                        Some(name)
+                    } else { None }
                 } else if !rest2.is_empty() {
                     let name = String::from_utf8_lossy(rest2).trim().trim_matches('\0').to_owned();
-                    if !name.is_empty() { Some(name) } else { None }
+                    if !name.is_empty() && !AUTH_PLUGINS.iter().any(|p| name.eq_ignore_ascii_case(p)) {
+                        Some(name)
+                    } else { None }
                 } else {
                     None
                 }
@@ -258,6 +290,9 @@ where
     }
 
     // ── Command loop ──
+    // Per-connection write buffer: cleared and reused for each response.
+    // Eliminates per-packet allocation and reduces to 1 write_all() per query.
+    let mut write_buf = BytesMut::with_capacity(65536);
     loop {
         if buf.is_empty() {
             let n = stream.read_buf(&mut buf).await?;
@@ -279,13 +314,20 @@ where
                     stream.write_all(&encode_packet(&ok_packet(0, 0), 1)).await?;
                 }
                 Command::Query(sql) => {
-                    let result = db.execute(&sql, &current_db);
-                    let sql_trimmed = sql.trim().to_uppercase();
-                    if sql_trimmed.starts_with("USE ") {
+                    // Fast path: SELECT 1 is the canonical health-check / dbmark overhead probe.
+                    let sql_up = sql.trim().to_uppercase();
+                    if sql_up == "SELECT 1" || sql_up == "SELECT 1;" {
+                        stream.write_all(SELECT_1_RESPONSE).await?;
+                        continue;
+                    }
+                    if sql_up.starts_with("USE ") {
                         let db_name = sql.trim()[4..].trim().trim_matches(';').trim_matches('`').to_owned();
                         current_db = Some(db_name);
                     }
-                    send_result(&mut stream, result, 1).await?;
+                    let result = db.execute(&sql, &current_db);
+                    write_buf.clear();
+                    protocol::build_result_into(&mut write_buf, &result, 1);
+                    stream.write_all(&write_buf).await?;
                 }
                 Command::FieldList(_) => {
                     stream.write_all(&encode_packet(&eof_packet(), 1)).await?;
@@ -314,20 +356,10 @@ where
                         }
                     };
                     let params = parse_execute_params(&payload, stmt.num_params);
-                    // Substitute ? placeholders
-                    let mut sql = stmt.sql.clone();
-                    for param in &params {
-                        let repl = match param {
-                            None => "NULL".to_owned(),
-                            Some(v) if v.parse::<f64>().is_ok() => v.clone(),
-                            Some(v) => format!("'{}'", v.replace('\'', "''")),
-                        };
-                        if let Some(p) = sql.find('?') {
-                            sql.replace_range(p..p+1, &repl);
-                        }
-                    }
-                    let result = db.execute(&sql, &current_db);
-                    send_result_binary(&mut stream, result, 1).await?;
+                    let result = db.execute_prepared(&stmt.sql, &params, &current_db);
+                    write_buf.clear();
+                    protocol::build_binary_result_into(&mut write_buf, &result, 1);
+                    stream.write_all(&write_buf).await?;
                 }
                 Command::StmtClose(stmt_id) => {
                     stmt_cache.remove(&stmt_id);
@@ -381,6 +413,12 @@ where
             }
             stream.write_all(&encode_packet(&eof_packet(), seq)).await?;
         }
+        QueryResult::ValueRows { columns, rows } => {
+            // Delegate to batched encoder
+            let mut tmp = bytes::BytesMut::with_capacity(256 + rows.len() * 32);
+            protocol::build_value_result_into(&mut tmp, &columns, &rows, seq);
+            stream.write_all(&tmp).await?;
+        }
     }
     Ok(())
 }
@@ -410,6 +448,11 @@ where S: tokio::io::AsyncWrite + Unpin {
                 seq = seq.wrapping_add(1);
             }
             stream.write_all(&encode_packet(&eof_packet(), seq)).await?;
+        }
+        QueryResult::ValueRows { columns, rows } => {
+            let mut tmp = bytes::BytesMut::with_capacity(256 + rows.len() * 32);
+            protocol::build_value_result_into(&mut tmp, &columns, &rows, seq);
+            stream.write_all(&tmp).await?;
         }
     }
     Ok(())

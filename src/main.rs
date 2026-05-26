@@ -1,6 +1,7 @@
 mod config;
 mod protocol;
 mod engine;
+mod simd_scan;
 mod auth;
 mod server;
 mod webui;

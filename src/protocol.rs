@@ -373,3 +373,231 @@ fn read_binary_datetime(payload: &[u8], pos: &mut usize) -> String {
     *pos += len;
     format!("{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
+
+// ── Inline writers — zero-alloc batch protocol encoding ────────────────────
+//
+// Each function writes directly into a caller-owned BytesMut.
+// Pattern: reserve 4-byte header placeholder, write payload, back-fill header.
+// Combined with build_result_into() this reduces N+4 write_all() calls
+// (one per packet) to a single write_all() for the entire result set.
+
+use crate::engine::QueryResult;
+
+/// Write a framed MySQL packet header + payload into buf (no intermediate alloc).
+#[inline(always)]
+pub fn write_packet_into(out: &mut BytesMut, payload: &[u8], seq: u8) {
+    let len = payload.len() as u32;
+    out.put_u8((len & 0xff) as u8);
+    out.put_u8(((len >> 8) & 0xff) as u8);
+    out.put_u8(((len >> 16) & 0xff) as u8);
+    out.put_u8(seq);
+    out.put_slice(payload);
+}
+
+/// Write a 9-byte EOF packet (protocol 4.1) directly into buf.
+#[inline(always)]
+pub fn write_eof_into(out: &mut BytesMut, seq: u8) {
+    out.put_slice(&[0x05, 0x00, 0x00, seq, 0xfe, 0x00, 0x00, 0x02, 0x00]);
+}
+
+/// Write a column definition packet directly into buf.
+pub fn write_col_def_into(out: &mut BytesMut, name: &str, col_type: u8, seq: u8) {
+    let hdr_pos = out.len();
+    out.put_bytes(0, 4); // placeholder
+    put_lenenc_str(out, "def");
+    put_lenenc_str(out, "");
+    put_lenenc_str(out, "");
+    put_lenenc_str(out, "");
+    put_lenenc_str(out, name);
+    put_lenenc_str(out, name); // org_name
+    out.put_u8(0x0c);
+    out.put_u16_le(0x21);
+    out.put_u32_le(255);
+    out.put_u8(col_type);
+    out.put_u16_le(0);
+    out.put_u8(0);
+    out.put_u16_le(0);
+    let pl = out.len() - hdr_pos - 4;
+    out[hdr_pos]   = (pl & 0xff) as u8;
+    out[hdr_pos+1] = ((pl >> 8) & 0xff) as u8;
+    out[hdr_pos+2] = ((pl >> 16) & 0xff) as u8;
+    out[hdr_pos+3] = seq;
+}
+
+/// Write a text-mode result row directly into buf.
+pub fn write_text_row_into(out: &mut BytesMut, row: &[Option<String>], seq: u8) {
+    let hdr_pos = out.len();
+    out.put_bytes(0, 4);
+    for v in row {
+        match v {
+            None    => out.put_u8(0xfb),
+            Some(s) => { put_lenenc(out, s.len() as u64); out.put_slice(s.as_bytes()); }
+        }
+    }
+    let pl = out.len() - hdr_pos - 4;
+    out[hdr_pos]   = (pl & 0xff) as u8;
+    out[hdr_pos+1] = ((pl >> 8) & 0xff) as u8;
+    out[hdr_pos+2] = ((pl >> 16) & 0xff) as u8;
+    out[hdr_pos+3] = seq;
+}
+
+/// Write a binary-mode result row (COM_STMT_EXECUTE) directly into buf.
+pub fn write_binary_row_into(out: &mut BytesMut, row: &[Option<String>], seq: u8) {
+    let n = row.len();
+    let null_bitmap_len = (n + 7 + 2) / 8;
+    let mut null_bitmap = vec![0u8; null_bitmap_len];
+    for (i, v) in row.iter().enumerate() {
+        if v.is_none() {
+            let bit = i + 2;
+            null_bitmap[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    let hdr_pos = out.len();
+    out.put_bytes(0, 4);
+    out.put_u8(0x00);
+    out.put_slice(&null_bitmap);
+    for v in row {
+        if let Some(s) = v {
+            put_lenenc(out, s.len() as u64);
+            out.put_slice(s.as_bytes());
+        }
+    }
+    let pl = out.len() - hdr_pos - 4;
+    out[hdr_pos]   = (pl & 0xff) as u8;
+    out[hdr_pos+1] = ((pl >> 8) & 0xff) as u8;
+    out[hdr_pos+2] = ((pl >> 16) & 0xff) as u8;
+    out[hdr_pos+3] = seq;
+}
+
+/// Serialize an entire QueryResult into buf as one contiguous block of MySQL packets.
+/// Caller issues a single write_all() syscall instead of N+4 per result set.
+pub fn build_result_into(buf: &mut BytesMut, result: &QueryResult, seq: u8) {
+    match result {
+        QueryResult::Ok { affected, last_insert_id } => {
+            let p = ok_packet(*affected, *last_insert_id);
+            write_packet_into(buf, &p, seq);
+        }
+        QueryResult::Err { code, message } => {
+            let p = err_packet(*code, message);
+            write_packet_into(buf, &p, seq);
+        }
+        QueryResult::Rows { columns, rows } => {
+            let n_cols = columns.len();
+            let mut s = seq;
+            buf.reserve(256 + n_cols * 40 + rows.len().saturating_mul(4 + n_cols * 20));
+            write_packet_into(buf, &[n_cols as u8], s); s = s.wrapping_add(1);
+            for col in columns { write_col_def_into(buf, col, 0xfd, s); s = s.wrapping_add(1); }
+            write_eof_into(buf, s); s = s.wrapping_add(1);
+            for row in rows { write_text_row_into(buf, row, s); s = s.wrapping_add(1); }
+            write_eof_into(buf, s);
+        }
+        QueryResult::ValueRows { columns, rows } => {
+            build_value_result_into(buf, columns, rows, seq);
+        }
+    }
+}
+
+/// Same as build_result_into but uses binary row encoding (COM_STMT_EXECUTE).
+pub fn build_binary_result_into(buf: &mut BytesMut, result: &QueryResult, seq: u8) {
+    match result {
+        QueryResult::Ok { affected, last_insert_id } => {
+            let p = ok_packet(*affected, *last_insert_id);
+            write_packet_into(buf, &p, seq);
+        }
+        QueryResult::Err { code, message } => {
+            let p = err_packet(*code, message);
+            write_packet_into(buf, &p, seq);
+        }
+        QueryResult::Rows { columns, rows } => {
+            let n_cols = columns.len();
+            let mut s = seq;
+            buf.reserve(256 + n_cols * 40 + rows.len().saturating_mul(4 + n_cols * 20));
+            write_packet_into(buf, &[n_cols as u8], s); s = s.wrapping_add(1);
+            for col in columns { write_col_def_into(buf, col, 0xfd, s); s = s.wrapping_add(1); }
+            write_eof_into(buf, s); s = s.wrapping_add(1);
+            for row in rows { write_binary_row_into(buf, row, s); s = s.wrapping_add(1); }
+            write_eof_into(buf, s);
+        }
+        QueryResult::ValueRows { columns, rows } => {
+            // For binary protocol, use text encoding (stmt_execute with VARCHAR columns)
+            build_value_result_into(buf, columns, rows, seq);
+        }
+    }
+}
+
+// ── ValueRows encoding — zero heap allocation per row ─────────────────────
+//
+// Integer values are formatted as ASCII on a stack buffer (no String alloc).
+// Text values are written as raw bytes from the stored String.
+
+/// Write a single i64 as ASCII decimal directly into buf.
+/// Uses stdlib fmt::Display (lookup-table optimized) via a custom fmt::Write wrapper.
+/// Zero heap allocation: the formatted digits go straight into the BytesMut.
+#[inline]
+fn write_i64_digits(out: &mut BytesMut, n: i64) {
+    use std::fmt::Write as FmtWrite;
+    // Wrapper: routes fmt output directly into our BytesMut (no intermediate String).
+    struct Sink<'a>(&'a mut BytesMut, usize); // field 1: buf, field 2: bytes_written
+    impl FmtWrite for Sink<'_> {
+        #[inline(always)]
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0.put_slice(s.as_bytes());
+            self.1 += s.len();
+            Ok(())
+        }
+    }
+    // Reserve 1 byte for the lenenc prefix (all i64 decimals fit in 1-byte lenenc ≤ 250)
+    let lenenc_pos = out.len();
+    out.put_u8(0); // placeholder
+    let mut sink = Sink(out, 0);
+    let _ = write!(sink, "{}", n);
+    let written = sink.1;
+    // Backfill lenenc (i64 max = 19 digits — always fits in 1-byte lenenc < 251)
+    out[lenenc_pos] = written as u8;
+}
+
+/// Write a Value directly into buf (text-mode MySQL encoding, no String conversion).
+#[inline]
+fn write_value_text(out: &mut BytesMut, v: &crate::engine::Value) {
+    use crate::engine::Value;
+    match v {
+        Value::Null       => out.put_u8(0xfb),
+        Value::Int(n)     => write_i64_digits(out, *n),
+        Value::Float(f)   => {
+            // floats still need formatting — use a stack string via itoa-style
+            let s = format!("{f}");
+            put_lenenc(out, s.len() as u64);
+            out.put_slice(s.as_bytes());
+        }
+        Value::Text(s)    => { put_lenenc(out, s.len() as u64); out.put_slice(s.as_bytes()); }
+        Value::Bytes(b)   => {
+            let h = hex::encode(b);
+            put_lenenc(out, h.len() as u64);
+            out.put_slice(h.as_bytes());
+        }
+    }
+}
+
+/// Write a ValueRows result row directly into buf — no String intermediate.
+pub fn write_value_row_into(out: &mut BytesMut, row: &[crate::engine::Value], seq: u8) {
+    let hdr_pos = out.len();
+    out.put_bytes(0, 4);
+    for v in row { write_value_text(out, v); }
+    let pl = out.len() - hdr_pos - 4;
+    out[hdr_pos]   = (pl & 0xff) as u8;
+    out[hdr_pos+1] = ((pl >> 8) & 0xff) as u8;
+    out[hdr_pos+2] = ((pl >> 16) & 0xff) as u8;
+    out[hdr_pos+3] = seq;
+}
+
+/// Build a ValueRows result into buf (zero allocation per row for Int values).
+pub fn build_value_result_into(buf: &mut BytesMut, columns: &[String], rows: &[Vec<crate::engine::Value>], seq: u8) {
+    let n_cols = columns.len();
+    let mut s = seq;
+    buf.reserve(256 + n_cols * 40 + rows.len().saturating_mul(4 + n_cols * 12));
+    write_packet_into(buf, &[n_cols as u8], s); s = s.wrapping_add(1);
+    for col in columns { write_col_def_into(buf, col, 0xfd, s); s = s.wrapping_add(1); }
+    write_eof_into(buf, s); s = s.wrapping_add(1);
+    for row in rows { write_value_row_into(buf, row, s); s = s.wrapping_add(1); }
+    write_eof_into(buf, s);
+}
