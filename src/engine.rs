@@ -140,6 +140,9 @@ pub struct Engine {
     pub databases: RwLock<HashMap<String, Arc<RwLock<Database>>>>,
     /// MySQL user accounts: username → DbUser
     pub users: RwLock<HashMap<String, DbUser>>,
+    /// Global write generation counter. Incremented on every INSERT/UPDATE/DELETE.
+    /// Per-connection L0 cache checks this to detect cross-connection invalidation.
+    pub write_gen: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -161,7 +164,11 @@ impl Engine {
             can_write: true,
             is_root: true,
         });
-        let engine = Self { databases: RwLock::new(dbs), users: RwLock::new(users) };
+        let engine = Self {
+            databases: RwLock::new(dbs),
+            users: RwLock::new(users),
+            write_gen: std::sync::atomic::AtomicU64::new(0),
+        };
 
         // Auto-load persisted data on startup
         let persist_path = format!("{}/runalexdb.sql", cfg.data_dir);
@@ -171,6 +178,18 @@ impl Engine {
         }
 
         engine
+    }
+
+    /// Increment write generation counter (called after any INSERT/UPDATE/DELETE).
+    #[inline(always)]
+    pub fn bump_write_gen(&self) {
+        self.write_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current write generation (for L0 cache validity checks).
+    #[inline(always)]
+    pub fn write_gen(&self) -> u64 {
+        self.write_gen.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Execute a SQL statement string in the context of `current_db`.
@@ -352,6 +371,10 @@ impl Engine {
         let mut last = QueryResult::ok(0, 0);
         for stmt in stmts.iter() {
             last = self.exec_stmt(stmt.clone(), current_db);
+            // Bump write generation for DML (enables L0 cache cross-connection invalidation)
+            if matches!(last, QueryResult::Ok { .. }) {
+                self.bump_write_gen();
+            }
         }
         last
     }

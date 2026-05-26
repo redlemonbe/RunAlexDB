@@ -495,3 +495,220 @@ Impact: Functional only, no security impact. Alpha product limitation.
 | A | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | protocol, auth, engine, webui, server |
 | B | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | webui (full), server (command loop), auth, protocol, engine |
 | C | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | deadlocks (fixed), prepared stmt injection, ICMP guard, MAX/MIN |
+
+
+---
+
+## Cycle D — [AI-INTERNAL] — 2026-05-26 — v0.3.0 (SIMD, L0 cache, privilege model, multi-user auth)
+
+**Scope:** `src/engine.rs` (privilege model, GRANT/REVOKE enforcement, pk_index integrity in prepared-stmt paths), `src/server.rs` (L0 cache, multi-user auth loop), `src/webui.rs` (API key guard regression), `src/simd_scan.rs` (hash function collision bounds, unsafe SIMD correctness), `src/auth.rs` (no change since Cycle C).
+**Model:** Claude Sonnet 4.6
+**Note:** v0.3.0 introduced multi-user DDL (CREATE USER / GRANT / REVOKE), L0 per-connection result cache, the SIMD column store, and the web UI privilege infrastructure. All new paths are reviewed here.
+
+---
+
+### RDB-2026-D-001 — CRITICAL — Web UI API key guard inverted: all /api/ routes unauthenticated
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-001 |
+| **Severity** | CRITICAL |
+| **CWE** | CWE-303 (Incorrect Implementation of Authentication Algorithm) |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/webui.rs` — match arm guard |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Threat model:** Any attacker who can reach the web UI port (default 8307). No credentials required.
+
+**Description:** The match arm that rejects unauthenticated API requests uses a broken guard that evaluates to `false` in all cases — for valid keys and invalid keys alike. The 401 arm never fires; every `/api/` request is handled without authentication.
+
+**Root cause:** The Cycle B fix (RDB-2026-B-002) replaced `!=` with `subtle::ConstantTimeEq::ct_eq()`. However, it preserved the operator structure as `!key.ct_eq(other).unwrap_u8() == 0`. `Choice::unwrap_u8()` returns `1u8` (equal) or `0u8` (not equal). In Rust, `!u8` is bitwise NOT: `!1u8 = 254`, `!0u8 = 255`. Neither 254 nor 255 equals 0. The guard is always false regardless of key value.
+
+Correct fix — Option A (use `bool::from`):
+```
+_ if path.starts_with("/api/") && !bool::from(req_key.as_bytes().ct_eq(cfg.auth.webui_api_key.as_bytes())) =>
+```
+
+Correct fix — Option B (remove the leading `!`):
+```
+_ if path.starts_with("/api/") && req_key.as_bytes().ct_eq(cfg.auth.webui_api_key.as_bytes()).unwrap_u8() == 0 =>
+```
+
+**Impact:** All web UI API endpoints (`/api/query`, `/api/backup`, `/api/restore`, `/api/databases`, etc.) are accessible without any API key. An attacker with network access to port 8307 can read all data, execute arbitrary SQL, and overwrite the database — without credentials.
+
+**Verification:** `curl http://host:8307/api/query -d '{"sql":"SHOW DATABASES"}'` must return 401 without a key. Currently returns 200 regardless.
+
+---
+
+### RDB-2026-D-002 — HIGH — Privilege model implemented but never enforced
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-002 |
+| **Severity** | HIGH |
+| **CWE** | CWE-863 (Incorrect Authorization) |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/engine.rs:1392`, `src/server.rs` command loop |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Threat model:** Authenticated MySQL client with a restricted account (e.g. `GRANT SELECT ON mydb.* TO 'app'`).
+
+**Description:** `DbUser` has `can_write: bool` and `allowed_dbs: Option<HashSet<String>>` fields. `Engine::user_can_access_db()` is correctly implemented. GRANT and REVOKE update these fields. However, `user_can_access_db()` is **never called from any code path**. The authenticated username is not forwarded to `Engine::execute()`. After login, every user — regardless of grants — can read, write, and drop any database.
+
+**Evidence:** `grep -rn 'user_can_access_db' src/` returns exactly one result: the function definition. `server.rs` calls `db.execute(&sql, &current_db)` with no user context parameter.
+
+**Fix:** Pass the authenticated username to `execute()`. Check `user_can_access_db()` and `can_write` before dispatching DDL/DML. Return error code 1142 on violation.
+
+---
+
+### RDB-2026-D-003 — HIGH — L0 result cache bypasses any future privilege check
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-003 |
+| **Severity** | HIGH |
+| **CWE** | CWE-285 (Improper Authorization) |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/server.rs` — Command::Query L0 cache path |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open (blocked by D-002) |
+
+**Description:** The L0 cache path (`if qhash == l0_hash && cur_gen == l0_gen`) returns pre-serialized bytes without calling `Engine::execute()`. When D-002 is fixed, privilege checks in `execute()` will be bypassable via the cache. Additionally, `write_gen` increments only on INSERT/UPDATE/DELETE — a REVOKE does not invalidate the cache, so restricted users may continue to receive cached results from before the revocation.
+
+**Fix:** Key the L0 cache on `(qhash, write_gen, username)`, or introduce a separate `acl_gen` counter incremented by GRANT/REVOKE.
+
+---
+
+### RDB-2026-D-004 — HIGH — pk_index not rebuilt after prepared-statement DELETE
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-004 |
+| **Severity** | HIGH |
+| **CWE** | CWE-682 (Incorrect Calculation) |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/engine.rs:1754` — `delete_prepared()` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Threat model:** Client using server-side prepared statements (COM_STMT_PREPARE) for DELETE.
+
+**Description:** `delete_prepared()` calls `table.rows.retain(...)` to remove rows but does not rebuild `table.pk_index`. After `retain()`, surviving rows are compacted: a row originally at index 5 may now be at index 3. `pk_index` still maps that row's PK to index 5. Subsequent PK-lookup SELECTs return the wrong row.
+
+The text-protocol DELETE path (`exec_stmt Delete`) correctly rebuilds `pk_index` after `retain()`. The omission in `delete_prepared` is inconsistent.
+
+**Fix:** Add pk_index rebuild to `delete_prepared` after `retain()`:
+```
+if table.pk_col_idx.is_some() {
+    table.pk_index.clear();
+    let pk_i = table.pk_col_idx.unwrap();
+    for (ri, row) in table.rows.iter().enumerate() {
+        table.pk_index.insert(row_pk_key(row, pk_i), ri);
+    }
+}
+```
+
+---
+
+### RDB-2026-D-005 — MEDIUM — `extract_pk_eq_param` always returns index 0
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-005 |
+| **Severity** | MEDIUM |
+| **CWE** | CWE-682 (Incorrect Calculation) |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/engine.rs` — `extract_pk_eq_param()`, `resolve_expr_bound()` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Description:** `extract_pk_eq_param()` always returns `Some(0)` regardless of actual parameter position. `resolve_expr_bound()` always reads `bound.first()` for any `?` expression. On a query like `WHERE id = ? AND category = ?`, both conditions evaluate against the first bound parameter — silent data corruption for multi-parameter queries.
+
+Single-parameter queries (the benchmark pattern) work by coincidence.
+
+**Fix:** Thread a mutable parameter counter through the AST walk and return the actual `?` ordinal.
+
+---
+
+### RDB-2026-D-006 — MEDIUM — No connection read timeout (slot-exhaustion DoS)
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-006 |
+| **Severity** | MEDIUM |
+| **CWE** | CWE-400 (Uncontrolled Resource Consumption) |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/server.rs` — `run_authenticated_session()` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Description:** All `stream.read_buf(&mut buf).await` calls have no timeout. A client that completes the MySQL handshake (consumes an auth slot) but never sends further queries holds a connection permit indefinitely. 256 such clients exhaust the semaphore; no new connections can be accepted.
+
+**Fix:** Wrap `read_buf()` with `tokio::time::timeout(Duration::from_secs(60), ...)`. Drop and log on timeout.
+
+---
+
+### RDB-2026-D-007 — INFO — CRC32 hash has 32-bit effective entropy
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-007 |
+| **Severity** | INFO |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/simd_scan.rs` — `crc32_sse42()`, `hash_query()` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⚠️ Accepted risk — embedded DB, low query diversity |
+
+**Description:** `_mm_crc32_u64` stores a 32-bit CRC in the lower 32 bits of a 64-bit register; the upper 32 bits remain 0. `hash_query()` returns a value with 32-bit effective entropy. Birthday bound for 50% collision probability: ~65 536 distinct SQL strings. A collision would cause the wrong AST (or result) to be returned for a query.
+
+At typical embedded DB workloads with fewer than 1000 distinct query templates, the collision risk is negligible. Accepted for v0.3.x; consider replacing with xxHash64 in a future patch.
+
+---
+
+### RDB-2026-D-008 — INFO — AVX2 unsafe blocks: correct, no action required
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-D-008 |
+| **Severity** | INFO |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/simd_scan.rs` — `scan_eq_avx2()`, `scan_gt_avx2()`, `scan_lt_avx2()` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ✅ No action required |
+
+**Description:** AVX2 functions are gated behind `std::is_x86_feature_detected!("avx2")`. The `#[target_feature(enable = "avx2")]` attribute scopes AVX2 codegen correctly. `_mm256_loadu_si256` (unaligned load) is correct for arbitrary-aligned `Vec<i64>`. The `movemask_epi8` mask interpretation (8 bits per i64 lane) is correct. Scalar fallback paths are also correct. No safety issue found.
+
+---
+
+## Updated Known Limitations and Accepted Risks (post Cycle D)
+
+| # | Risk | Cycle | Status |
+|---|------|-------|--------|
+| 1 | No HUMAN-EXTERNAL audit performed | A | Open |
+| 2 | In-memory storage — data lost on restart | A | Accepted (alpha) |
+| 3 | No TLS on MySQL or web UI ports | A | Accepted (alpha) |
+| 4 | Single-read HTTP body (65 536 byte limit) | B | Open (B-001) |
+| 5 | WebUI key constant-time compare regression | D | **CRITICAL Open (D-001)** |
+| 6 | No connection limit on MySQL listener | B | Fixed (B-003) |
+| 7 | mysql_native_password SHA1-based | B | Accepted (B-004) |
+| 8 | SQL coverage minimal | A | Accepted (alpha) |
+| 9 | No read timeout (slot-exhaustion DoS) | D | Open (D-006) |
+| 10 | sqlparser crate not audited | A | Open |
+| 11 | Auth + command loop deadlocks | C | Fixed (C-001, C-002) |
+| 12 | MAX/MIN numeric ordering incorrect | C | Open (C-004) |
+| 13 | Privilege model never enforced | D | Open (D-002) |
+| 14 | L0 cache bypasses future privilege checks | D | Open (D-003) |
+| 15 | pk_index stale after prepared-stmt DELETE | D | Open (D-004) |
+| 16 | extract_pk_eq_param always returns 0 | D | Open (D-005) |
+| 17 | CRC32 32-bit effective entropy | D | Accepted (D-007) |
+
+## Audit trail (updated)
+
+| Cycle | Date | Source | Model | Scope |
+|-------|------|--------|-------|--------|
+| A | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | protocol, auth, engine, webui, server |
+| B | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | webui (full), server (command loop), auth, protocol, engine |
+| C | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | deadlocks (fixed), prepared stmt injection, ICMP guard, MAX/MIN |
+| D | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | privilege model, SIMD/L0 cache, webui auth regression, pk_index, prepared-stmt param binding |

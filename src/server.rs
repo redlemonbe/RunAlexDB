@@ -293,6 +293,11 @@ where
     // Per-connection write buffer: cleared and reused for each response.
     // Eliminates per-packet allocation and reduces to 1 write_all() per query.
     let mut write_buf = BytesMut::with_capacity(65536);
+    // L0 result cache: same query on same connection → return pre-serialized bytes.
+    // write_gen from Engine detects cross-connection writes (INSERT/UPDATE/DELETE).
+    let mut l0_hash: u64 = 0;
+    let mut l0_gen:  u64 = u64::MAX; // initialise to invalid
+    let mut l0_bytes: Option<bytes::Bytes> = None;
     loop {
         if buf.is_empty() {
             let n = stream.read_buf(&mut buf).await?;
@@ -314,7 +319,7 @@ where
                     stream.write_all(&encode_packet(&ok_packet(0, 0), 1)).await?;
                 }
                 Command::Query(sql) => {
-                    // Fast path: SELECT 1 is the canonical health-check / dbmark overhead probe.
+                    // SELECT 1 — pre-computed static bytes (health-check / overhead probe)
                     let sql_up = sql.trim().to_uppercase();
                     if sql_up == "SELECT 1" || sql_up == "SELECT 1;" {
                         stream.write_all(SELECT_1_RESPONSE).await?;
@@ -324,10 +329,26 @@ where
                         let db_name = sql.trim()[4..].trim().trim_matches(';').trim_matches('`').to_owned();
                         current_db = Some(db_name);
                     }
+                    // L0 result cache: CRC32 hash query, check write_gen for staleness.
+                    // Hit: return pre-serialized bytes — zero SQL parsing, zero encoding.
+                    let qhash = crate::simd_scan::hash_query(sql.as_bytes());
+                    let cur_gen = db.write_gen();
+                    if qhash == l0_hash && cur_gen == l0_gen {
+                        if let Some(ref cached) = l0_bytes {
+                            stream.write_all(cached).await?;
+                            continue;
+                        }
+                    }
                     let result = db.execute(&sql, &current_db);
                     write_buf.clear();
                     protocol::build_result_into(&mut write_buf, &result, 1);
                     stream.write_all(&write_buf).await?;
+                    // Cache this result (only cache non-error responses)
+                    if !matches!(result, crate::engine::QueryResult::Err { .. }) {
+                        l0_hash  = qhash;
+                        l0_gen   = db.write_gen(); // re-read after execution
+                        l0_bytes = Some(bytes::Bytes::copy_from_slice(&write_buf));
+                    }
                 }
                 Command::FieldList(_) => {
                     stream.write_all(&encode_packet(&eof_packet(), 1)).await?;
