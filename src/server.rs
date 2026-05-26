@@ -199,8 +199,23 @@ where
                 let len = rest[0] as usize;
                 (&rest[1..1 + len.min(rest.len() - 1)], &rest[1 + len.min(rest.len() - 1)..])
             };
-            if !verify_native_password(&cfg.auth.root_password, &scramble, auth_resp) {
-                warn!("auth failed from {peer}");
+            // Multi-user auth: check username against user table
+            let username_str = _username.trim_matches(' ').to_owned();
+            let effective_user = if username_str.is_empty() { "root".to_owned() } else { username_str.clone() };
+            let auth_ok = {
+                // Try user table first
+                if let Some((stored_hash2, _is_root)) = db.lookup_user(&effective_user) {
+                    // verify_native_password_hash takes SHA1(SHA1(pw)) directly
+                    crate::auth::verify_native_password_hash(&stored_hash2, &scramble, auth_resp)
+                } else if effective_user == "root" {
+                    // Fallback to config root password
+                    verify_native_password(&cfg.auth.root_password, &scramble, auth_resp)
+                } else {
+                    false
+                }
+            };
+            if !auth_ok {
+                warn!(user = %effective_user, "auth failed from {peer}");
                 stream.write_all(&encode_packet(&err_packet(1045, "Access denied"), 2)).await?;
                 return Ok(());
             }

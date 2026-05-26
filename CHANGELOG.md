@@ -1,5 +1,23 @@
 # Changelog — RunAlexDB
 
+## [0.2.0] — 2026-05-26
+
+### Added
+
+- **MySQL user system**: `CREATE USER 'name'@'%' IDENTIFIED BY 'password'` — creates a new database account.
+- **GRANT**: `GRANT SELECT|ALL PRIVILEGES ON db.* TO 'user'` — assigns per-database or global privileges.
+- **REVOKE**: `REVOKE ... ON db.* FROM 'user'` — removes a privilege.
+- **DROP USER**: removes a user account.
+- **SHOW GRANTS FOR 'user'**: lists the effective grants for a user.
+- **SHOW USERS**: lists all accounts.
+- Multi-user authentication: the MySQL listener now authenticates against the user table; each user has an independent SHA1(SHA1(password)) hash.
+- `Engine::lookup_user()` and `Engine::user_can_access_db()` helpers for per-request access control.
+- `verify_native_password_hash()` in auth.rs — verifies client responses against a pre-hashed stored credential.
+
+Closes #11
+
+---
+
 ## [0.1.6] — 2026-05-26
 
 ### Added

@@ -92,8 +92,20 @@ pub struct Database {
 
 // ── Engine ─────────────────────────────────────────────────────────────────
 
+/// Per-user credentials and privileges.
+#[derive(Clone, Debug)]
+pub struct DbUser {
+    pub password_sha1_sha1: Vec<u8>, // SHA1(SHA1(password)) for native_password auth
+    /// None = all databases; Some(set) = whitelist
+    pub allowed_dbs: Option<std::collections::HashSet<String>>,
+    pub can_write: bool, // false = SELECT only
+    pub is_root: bool,
+}
+
 pub struct Engine {
     pub databases: RwLock<HashMap<String, Arc<RwLock<Database>>>>,
+    /// MySQL user accounts: username → DbUser
+    pub users: RwLock<HashMap<String, DbUser>>,
 }
 
 impl Engine {
@@ -106,7 +118,16 @@ impl Engine {
                 tables: HashMap::new(),
             })));
         }
-        let engine = Self { databases: RwLock::new(dbs) };
+        // Initialise root user from config password
+        let mut users = HashMap::new();
+        let root_hash = double_sha1(cfg.auth.root_password.as_bytes());
+        users.insert("root".to_owned(), DbUser {
+            password_sha1_sha1: root_hash,
+            allowed_dbs: None,
+            can_write: true,
+            is_root: true,
+        });
+        let engine = Self { databases: RwLock::new(dbs), users: RwLock::new(users) };
 
         // Auto-load persisted data on startup
         let persist_path = format!("{}/runalexdb.sql", cfg.data_dir);
@@ -130,6 +151,27 @@ impl Engine {
                 vec!["VERSION()"],
                 vec![vec![Some(String::from("8.0.32-RunAlexDB"))]],
             );
+        }
+        // ── User DDL (not in sqlparser) ──────────────────────────────────────
+        if sql_upper.starts_with("CREATE USER") {
+            return self.exec_create_user(sql.trim());
+        }
+        if sql_upper.starts_with("DROP USER") {
+            return self.exec_drop_user(sql.trim());
+        }
+        if sql_upper.starts_with("GRANT ") {
+            return self.exec_grant(sql.trim());
+        }
+        if sql_upper.starts_with("REVOKE ") {
+            return self.exec_revoke(sql.trim());
+        }
+        if sql_upper.starts_with("SHOW GRANTS") {
+            return self.exec_show_grants(sql.trim());
+        }
+        if sql_upper.starts_with("SHOW USERS") || sql_upper == "SELECT USER FROM MYSQL.USER" {
+            let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+            let rows: Vec<_> = users.keys().map(|u| vec![Some(u.clone())]).collect();
+            return QueryResult::rows(vec!["User"], rows);
         }
         if sql_upper.starts_with("SHOW DATABASES") {
             let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
@@ -927,3 +969,273 @@ fn expr_to_value(expr: Expr) -> Value {
 }
 
 fn _check_result(_: Result<()>) {}
+
+// ── User management helpers ────────────────────────────────────────────────
+
+fn double_sha1(data: &[u8]) -> Vec<u8> {
+    use sha1::{Digest, Sha1};
+    let h1 = Sha1::digest(data);
+    Sha1::digest(&h1).to_vec()
+}
+
+impl Engine {
+    // ── CREATE USER 'name'@'%' IDENTIFIED BY 'password' ──────────────────
+
+    pub fn exec_create_user(&self, sql: &str) -> QueryResult {
+        // Parse: CREATE USER 'user'@'host' IDENTIFIED BY 'pass'
+        //    or: CREATE USER 'user' IDENTIFIED BY 'pass'
+        //    or: CREATE USER 'user' (no password)
+        let rest = sql.trim_start_matches(|c: char| !c.is_whitespace()).trim();
+        let rest = rest.trim_start_matches(|c: char| c.is_whitespace());
+        // skip "USER" keyword
+        let rest = if rest.to_uppercase().starts_with("USER") { &rest[4..].trim_start() } else { rest };
+
+        // Extract username (with optional @host which we ignore)
+        let (username, password) = parse_user_ident_with_password(rest);
+
+        if username.is_empty() {
+            return QueryResult::err(1064, "CREATE USER: cannot parse username");
+        }
+        if username == "root" {
+            return QueryResult::err(1396, "Operation CREATE USER failed for 'root'@'%'");
+        }
+
+        let hash = double_sha1(password.as_bytes());
+        let mut users = self.users.write().unwrap_or_else(|e| e.into_inner());
+        if users.contains_key(&username) {
+            return QueryResult::err(1396, &format!("Operation CREATE USER failed for '{username}'@'%'"));
+        }
+        users.insert(username.clone(), DbUser {
+            password_sha1_sha1: hash,
+            allowed_dbs: Some(std::collections::HashSet::new()), // no access by default
+            can_write: false,
+            is_root: false,
+        });
+        tracing::info!(user = %username, "CREATE USER");
+        QueryResult::ok(0, 0)
+    }
+
+    // ── DROP USER ─────────────────────────────────────────────────────────
+
+    pub fn exec_drop_user(&self, sql: &str) -> QueryResult {
+        let rest = sql["DROP USER".len()..].trim().trim_matches('\'').trim_matches('`');
+        let username = rest.split('@').next().unwrap_or(rest).trim_matches('\'').trim_matches('`').trim();
+        if username == "root" {
+            return QueryResult::err(1396, "Cannot drop root user");
+        }
+        let mut users = self.users.write().unwrap_or_else(|e| e.into_inner());
+        if users.remove(username).is_none() {
+            return QueryResult::err(1396, &format!("Operation DROP USER failed for '{username}'@'%'"));
+        }
+        tracing::info!(user = %username, "DROP USER");
+        QueryResult::ok(0, 0)
+    }
+
+    // ── GRANT SELECT|INSERT|UPDATE|DELETE|ALL ON db.* TO 'user' ──────────
+
+    pub fn exec_grant(&self, sql: &str) -> QueryResult {
+        // GRANT <privs> ON <db>.* TO 'user'[@'host'] [IDENTIFIED BY 'pass']
+        let upper = sql.to_uppercase();
+        let to_pos = upper.find(" TO ").ok_or(()).unwrap_err();
+        if let Some(to_pos) = upper.find(" TO ") {
+            let privs_on = &sql[6..to_pos].trim(); // skip "GRANT "
+            let rest = sql[to_pos + 4..].trim();
+
+            // Extract user and optional password
+            let (username, new_password) = parse_user_ident_with_password(rest);
+            if username.is_empty() {
+                return QueryResult::err(1064, "GRANT: cannot parse username");
+            }
+
+            // Parse db name from "ON db.* " or "ON *.*"
+            let db_name = if let Some(on_pos) = privs_on.to_uppercase().find(" ON ") {
+                let on_part = privs_on[on_pos + 4..].trim();
+                let db = on_part.split('.').next().unwrap_or("*").trim().trim_matches('`').trim_matches('\'');
+                if db == "*" { None } else { Some(db.to_owned()) }
+            } else {
+                None
+            };
+
+            let all_privs = privs_on.to_uppercase().contains("ALL");
+            let can_write = all_privs
+                || privs_on.to_uppercase().contains("INSERT")
+                || privs_on.to_uppercase().contains("UPDATE")
+                || privs_on.to_uppercase().contains("DELETE")
+                || privs_on.to_uppercase().contains("CREATE")
+                || privs_on.to_uppercase().contains("DROP");
+
+            let mut users = self.users.write().unwrap_or_else(|e| e.into_inner());
+            let user = users.entry(username.clone()).or_insert_with(|| {
+                // Auto-create user if it doesn't exist (MySQL behaviour with IDENTIFIED BY)
+                DbUser {
+                    password_sha1_sha1: double_sha1(b""),
+                    allowed_dbs: Some(std::collections::HashSet::new()),
+                    can_write: false,
+                    is_root: false,
+                }
+            });
+
+            // Update password if IDENTIFIED BY clause present
+            if !new_password.is_empty() {
+                user.password_sha1_sha1 = double_sha1(new_password.as_bytes());
+            }
+
+            if all_privs && db_name.is_none() {
+                // GRANT ALL ON *.* — global access
+                user.allowed_dbs = None;
+                user.can_write = true;
+            } else if let Some(ref db) = db_name {
+                if let Some(ref mut set) = user.allowed_dbs {
+                    set.insert(db.clone());
+                }
+                if can_write { user.can_write = true; }
+            }
+
+            tracing::info!(user = %username, db = ?db_name, can_write, "GRANT");
+            QueryResult::ok(0, 0)
+        } else {
+            QueryResult::err(1064, "GRANT: syntax error — missing TO")
+        }
+    }
+
+    // ── REVOKE ────────────────────────────────────────────────────────────
+
+    pub fn exec_revoke(&self, sql: &str) -> QueryResult {
+        let upper = sql.to_uppercase();
+        if let Some(from_pos) = upper.find(" FROM ") {
+            let rest = sql[from_pos + 6..].trim();
+            let username = rest.split('@').next().unwrap_or(rest)
+                .trim_matches('\'').trim_matches('`').trim();
+            let privs_on = &sql[7..from_pos].trim(); // skip "REVOKE "
+            let db_name = if let Some(on_pos) = privs_on.to_uppercase().find(" ON ") {
+                let on_part = privs_on[on_pos + 4..].trim();
+                let db = on_part.split('.').next().unwrap_or("*").trim().trim_matches('`').trim_matches('\'');
+                if db == "*" { None } else { Some(db.to_owned()) }
+            } else {
+                None
+            };
+
+            let mut users = self.users.write().unwrap_or_else(|e| e.into_inner());
+            let user = match users.get_mut(username) {
+                Some(u) => u,
+                None => return QueryResult::err(1396, &format!("No such user '{username}'")),
+            };
+            if let Some(ref db) = db_name {
+                if let Some(ref mut set) = user.allowed_dbs {
+                    set.remove(db);
+                }
+            } else {
+                // Revoke global — restrict to empty set
+                user.allowed_dbs = Some(std::collections::HashSet::new());
+                user.can_write = false;
+            }
+            tracing::info!(user = %username, db = ?db_name, "REVOKE");
+            QueryResult::ok(0, 0)
+        } else {
+            QueryResult::err(1064, "REVOKE: syntax error — missing FROM")
+        }
+    }
+
+    // ── SHOW GRANTS FOR 'user' ────────────────────────────────────────────
+
+    pub fn exec_show_grants(&self, sql: &str) -> QueryResult {
+        let for_user = if let Some(pos) = sql.to_uppercase().find(" FOR ") {
+            sql[pos + 5..].trim().split('@').next()
+                .unwrap_or("").trim_matches('\'').trim_matches('`').trim().to_owned()
+        } else {
+            String::new()
+        };
+
+        let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+        let user = match users.get(&for_user) {
+            Some(u) => u,
+            None => return QueryResult::err(1141, &format!("No such user '{for_user}'")),
+        };
+
+        let rows = if user.allowed_dbs.is_none() {
+            // Global access
+            let priv_str = if user.can_write { "ALL PRIVILEGES" } else { "SELECT" };
+            vec![vec![Some(format!("GRANT {priv_str} ON *.* TO '{for_user}'@'%'"))]]
+        } else {
+            let set = user.allowed_dbs.as_ref().unwrap();
+            if set.is_empty() {
+                vec![vec![Some(format!("GRANT USAGE ON *.* TO '{for_user}'@'%'"))]]
+            } else {
+                let priv_str = if user.can_write { "ALL PRIVILEGES" } else { "SELECT" };
+                set.iter().map(|db| {
+                    vec![Some(format!("GRANT {priv_str} ON `{db}`.* TO '{for_user}'@'%'"))]
+                }).collect()
+            }
+        };
+
+        QueryResult::rows(vec![&format!("Grants for {for_user}@%")], rows)
+    }
+
+    // ── Auth helper — check credentials at connection time ────────────────
+
+    /// Returns true if the given user is allowed to authenticate.
+    /// The password check (native_password SHA1 XOR) is done in auth.rs;
+    /// this method only checks whether the user exists and returns the
+    /// stored SHA1(SHA1(password)) hash.
+    pub fn lookup_user(&self, username: &str) -> Option<(Vec<u8>, bool)> {
+        let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+        users.get(username).map(|u| (u.password_sha1_sha1.clone(), u.is_root))
+    }
+
+    /// Check if a user has access to a given database.
+    pub fn user_can_access_db(&self, username: &str, db: &str) -> bool {
+        let users = self.users.read().unwrap_or_else(|e| e.into_inner());
+        match users.get(username) {
+            None => false,
+            Some(u) => {
+                if u.is_root || u.allowed_dbs.is_none() { return true; }
+                u.allowed_dbs.as_ref().map(|s| s.contains(db)).unwrap_or(false)
+            }
+        }
+    }
+}
+
+// ── Parse helpers ─────────────────────────────────────────────────────────
+
+/// Parse `'username'@'host' [IDENTIFIED BY 'password']`
+/// Returns (username, password).
+fn parse_user_ident_with_password(s: &str) -> (String, String) {
+    let s = s.trim();
+    // Extract quoted or bare username
+    let (username, rest) = if s.starts_with('\'') {
+        let end = s[1..].find('\'').map(|p| p + 1).unwrap_or(s.len() - 1);
+        (s[1..end].to_owned(), &s[end + 1..])
+    } else if s.starts_with('`') {
+        let end = s[1..].find('`').map(|p| p + 1).unwrap_or(s.len() - 1);
+        (s[1..end].to_owned(), &s[end + 1..])
+    } else {
+        let end = s.find(|c: char| c == '@' || c.is_whitespace()).unwrap_or(s.len());
+        (s[..end].to_owned(), &s[end..])
+    };
+
+    // Skip @'host' if present
+    let rest = rest.trim_start_matches(|c: char| c == '@' || c == '\'');
+    let rest = if rest.starts_with('\'') {
+        let end = rest[1..].find('\'').map(|p| p + 2).unwrap_or(rest.len());
+        &rest[end..]
+    } else {
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+        &rest[end..]
+    };
+
+    // Look for IDENTIFIED BY 'password'
+    let upper = rest.to_uppercase();
+    let password = if let Some(pos) = upper.find("IDENTIFIED BY") {
+        let pw_rest = rest[pos + 13..].trim();
+        if pw_rest.starts_with('\'') {
+            let end = pw_rest[1..].find('\'').unwrap_or(pw_rest.len() - 1);
+            pw_rest[1..end + 1].to_owned()
+        } else {
+            pw_rest.split_whitespace().next().unwrap_or("").to_owned()
+        }
+    } else {
+        String::new()
+    };
+
+    (username, password)
+}
