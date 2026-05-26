@@ -56,6 +56,27 @@ async fn main() -> Result<()> {
     let db = std::sync::Arc::new(engine::Engine::new(&cfg));
     let db_shutdown = std::sync::Arc::clone(&db);
     let data_dir_shutdown = cfg.data_dir.clone();
+
+    // Periodic auto-checkpoint (configurable interval, default 300 s).
+    if cfg.checkpoint_interval_secs > 0 {
+        let db_ckpt = std::sync::Arc::clone(&db);
+        let data_dir_ckpt = cfg.data_dir.clone();
+        let interval_secs = cfg.checkpoint_interval_secs;
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            tick.tick().await; // skip first tick
+            loop {
+                tick.tick().await;
+                let sql = db_ckpt.dump_sql();
+                let path = format!("{}/runalexdb.sql", data_dir_ckpt);
+                let tmp = format!("{}/runalexdb.sql.tmp", data_dir_ckpt);
+                if std::fs::write(&tmp, &sql).is_ok() {
+                    let _ = std::fs::rename(&tmp, &path);
+                    tracing::debug!("Auto-checkpoint written to {path}");
+                }
+            }
+        });
+    }
     tokio::spawn(async move {
         #[cfg(unix)]
         {

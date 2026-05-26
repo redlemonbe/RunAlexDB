@@ -449,6 +449,26 @@ impl Engine {
                 let _ = u;
                 QueryResult::ok(0, 0)
             }
+            Statement::Truncate { table_names, .. } => {
+                let name = table_names.first().map(|t| t.name.to_string()).unwrap_or_default();
+                let (eff_db, eff_table) = if let Some(dot) = name.find('.') {
+                    (name[..dot].trim_matches('`').to_owned(), name[dot+1..].trim_matches('`').to_owned())
+                } else {
+                    let db = current_db.clone().unwrap_or_default();
+                    (db, name.trim_matches('`').to_owned())
+                };
+                let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
+                let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+                let Some(table) = db.tables.get_mut(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
+                let affected = table.rows.len() as u64;
+                table.rows.clear();
+                table.pk_index.clear();
+                for store in table.col_int_data.iter_mut().flatten() { store.clear(); }
+                for store in table.col_str_data.iter_mut().flatten() { store.clear(); }
+                self.bump_write_gen();
+                QueryResult::ok(affected, 0)
+            }
             _ => QueryResult::err(1295, "Statement not yet supported"),
         }
     }

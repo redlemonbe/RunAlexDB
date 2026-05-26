@@ -38,6 +38,9 @@ pub struct Config {
 
     #[serde(default = "default_handshake_timeout_secs")]
     pub handshake_timeout_secs: u64,
+
+    #[serde(default = "default_checkpoint_interval_secs")]
+    pub checkpoint_interval_secs: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -121,10 +124,12 @@ impl Default for Config {
             icmp_protection: default_icmp_protection(),
             connection_timeout_secs: default_connection_timeout_secs(),
             handshake_timeout_secs: default_handshake_timeout_secs(),
+            checkpoint_interval_secs: default_checkpoint_interval_secs(),
         }
     }
 }
 
 fn default_icmp_protection() -> bool { true }
+fn default_checkpoint_interval_secs() -> u64 { 300 }
 fn default_connection_timeout_secs() -> u64 { 300 }
 fn default_handshake_timeout_secs() -> u64 { 10 }
