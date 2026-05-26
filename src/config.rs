@@ -23,6 +23,13 @@ pub struct Config {
 
     #[serde(default)]
     pub xdp: XdpConfig,
+
+    #[serde(default = "default_fw_manage")]
+    pub firewall_manage:  bool,
+    #[serde(default)]
+    pub firewall_backend: Option<String>,
+    #[serde(default = "default_fw_tag")]
+    pub firewall_tag:     String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -62,6 +69,8 @@ fn default_bind() -> String { "0.0.0.0".into() }
 fn default_data_dir() -> String { "/var/lib/runalexdb".into() }
 fn default_root_password() -> String { "changeme".into() }
 fn default_webui_key() -> String { "changeme".into() }
+fn default_fw_manage() -> bool { true }
+fn default_fw_tag() -> String { "runalexdb".into() }
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -89,7 +98,10 @@ impl Default for Config {
             data_dir: default_data_dir(),
             tls: TlsConfig::default(),
             auth: AuthConfig::default(),
-            xdp: XdpConfig::default(),
+            xdp:             XdpConfig::default(),
+            firewall_manage:  default_fw_manage(),
+            firewall_backend: None,
+            firewall_tag:     default_fw_tag(),
         }
     }
 }

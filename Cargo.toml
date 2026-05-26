@@ -1,6 +1,6 @@
 [package]
 name        = "runalexdb"
-version     = "0.1.0"
+version     = "0.1.1"
 edition     = "2021"
 description = "High-performance SQL database — MySQL/MariaDB wire protocol, XDP fast-path, SIMD query engine"
 license     = "AGPL-3.0-only"
