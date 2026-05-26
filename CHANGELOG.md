@@ -1,5 +1,19 @@
 # Changelog — RunAlexDB
 
+## [0.1.6] — 2026-05-26
+
+### Added
+
+- **TLS support**: `tls.enabled = true` in config enables TLS on the MySQL port.
+- Auto-generated self-signed certificate (rcgen) if no cert/key paths are provided — zero-config TLS.
+- Custom cert/key: `tls.cert` and `tls.key` config fields accept PEM file paths.
+- SSLRequest detection: server advertises `CLIENT_SSL` capability in greeting; clients that request TLS are upgraded transparently. Plain-text clients continue to work unchanged.
+- `server_greeting_tls()` protocol helper advertising full SSL capabilities.
+
+Closes #5
+
+---
+
 ## [0.1.5] — 2026-05-26
 
 ### Added

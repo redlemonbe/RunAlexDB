@@ -35,6 +35,7 @@ pub const CAPABILITY_PROTOCOL_41: u32         = 512;
 pub const CAPABILITY_SECURE_CONNECTION: u32   = 32768;
 pub const CAPABILITY_PLUGIN_AUTH: u32         = 1 << 19;
 pub const CAPABILITY_CONNECT_WITH_DB: u32     = 8;
+pub const CAPABILITY_SSL: u32                 = 1 << 11; // CLIENT_SSL
 
 /// Build a server greeting (HandshakeV10).
 pub fn server_greeting(server_id: u32, auth_data: &[u8; 20]) -> Bytes {
@@ -56,6 +57,33 @@ pub fn server_greeting(server_id: u32, auth_data: &[u8; 20]) -> Bytes {
     out.put_u8(21); // auth_plugin_data_len
     out.put_bytes(0, 10); // reserved
     out.put_slice(&auth_data[8..]); // scramble part 2
+    out.put_u8(0);
+    out.put_slice(b"mysql_native_password\0");
+
+    out.freeze()
+}
+
+/// Build a server greeting advertising TLS support (CLIENT_SSL capability).
+pub fn server_greeting_tls(server_id: u32, auth_data: &[u8; 20]) -> Bytes {
+    let mut out = BytesMut::new();
+    out.put_u8(10);
+    out.put_slice(b"8.0.32-RunAlexDB\0");
+    out.put_u32_le(server_id);
+    out.put_slice(&auth_data[..8]);
+    out.put_u8(0);
+
+    let caps: u32 = CAPABILITY_LONG_PASSWORD
+        | CAPABILITY_PROTOCOL_41
+        | CAPABILITY_SECURE_CONNECTION
+        | CAPABILITY_PLUGIN_AUTH
+        | CAPABILITY_SSL;
+    out.put_u16_le((caps & 0xffff) as u16);
+    out.put_u8(0x21);
+    out.put_u16_le(2);
+    out.put_u16_le((caps >> 16) as u16);
+    out.put_u8(21);
+    out.put_bytes(0, 10);
+    out.put_slice(&auth_data[8..]);
     out.put_u8(0);
     out.put_slice(b"mysql_native_password\0");
 
