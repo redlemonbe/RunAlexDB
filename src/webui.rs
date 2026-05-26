@@ -44,10 +44,27 @@ pub async fn run(cfg: Config, db: Arc<Engine>) -> Result<()> {
                     String::new()
                 };
 
+                // Extract X-API-Key or Authorization: Bearer from headers
+                let req_key = raw.lines()
+                    .find(|l| l.to_lowercase().starts_with("x-api-key:"))
+                    .map(|l| l[10..].trim().to_owned())
+                    .or_else(|| raw.lines()
+                        .find(|l| l.to_lowercase().starts_with("authorization:"))
+                        .and_then(|l| l.split_whitespace().nth(1).map(|s| s.trim_start_matches("Bearer ").to_owned())))
+                    .unwrap_or_default();
+
                 let resp = match (method, path) {
                     ("GET", "/" | "/ui" | "/index.html") => {
                         let html = UI_HTML.replace("{{API_KEY}}", &cfg.auth.webui_api_key);
                         http_response(200, "text/html; charset=utf-8", html.as_bytes())
+                    }
+                    // OPTIONS preflight
+                    ("OPTIONS", _) => {
+                        http_response(204, "text/plain", b"")
+                    }
+                    // API routes — require valid key
+                    _ if path.starts_with("/api/") && req_key != cfg.auth.webui_api_key => {
+                        http_response(401, "application/json", br#"{"error":"Unauthorized"}"#)
                     }
                     ("GET", "/api/system") => {
                         let json = api_system(&db, &cfg);
