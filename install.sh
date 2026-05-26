@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# RunAlexDB install script — installs binary, config, systemd unit.
-# Usage: curl -fsSL https://raw.githubusercontent.com/redlemonbe/RunAlexDB/main/install.sh | sudo bash
+# RunAlexDB install script
+# Usage: curl -fsSL https://raw.githubusercontent.com/redlemonbe/RunAlexDB/main/install.sh | bash
 # Or:    bash install.sh [--prefix /usr/local] [--config /etc/runalexdb]
 
 set -euo pipefail
@@ -13,7 +13,6 @@ err()   { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 
 PREFIX="${PREFIX:-/usr/local}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/runalexdb}"
-LOG_DIR="${LOG_DIR:-/var/log/runalexdb}"
 DATA_DIR="${DATA_DIR:-/var/lib/runalexdb}"
 SERVICE_USER="${SERVICE_USER:-runalexdb}"
 VERSION="${VERSION:-latest}"
@@ -32,10 +31,8 @@ case "$ARCH" in
     *)       err "Unsupported architecture: $ARCH" ;;
 esac
 
-if ldd --version 2>&1 | grep -qi musl; then
+if ldd --version 2>&1 | grep -qi musl 2>/dev/null; then
     LIBC="musl"
-elif command -v ldd >/dev/null && ldd --version 2>&1 | grep -qi GLIBC; then
-    LIBC="gnu"
 else
     LIBC="gnu"
 fi
@@ -57,52 +54,54 @@ elif command -v wget >/dev/null; then
 else
     err "curl or wget required"
 fi
-
 chmod +x "$TMP"
-install -Dm755 "$TMP" "$PREFIX/bin/runalexdb"
-rm -f "$TMP"
+mv "$TMP" "$PREFIX/bin/runalexdb"
 ok "Binary installed to $PREFIX/bin/runalexdb"
 
 # Create service user
 if ! id "$SERVICE_USER" &>/dev/null; then
     useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
-    ok "Created system user $SERVICE_USER"
+    ok "Created service user: $SERVICE_USER"
 fi
 
-mkdir -p "$CONFIG_DIR" "$LOG_DIR" "$DATA_DIR"
-chown -R "$SERVICE_USER:$SERVICE_USER" "$LOG_DIR" "$DATA_DIR" 2>/dev/null || true
+# Create directories
+mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$DATA_DIR/backups"
+chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$DATA_DIR/backups"
+ok "Directories created"
 
+# Write default config if none exists
 if [[ ! -f "$CONFIG_DIR/runalexdb.toml" ]]; then
-    ROOT_PASS=$(head -c 24 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 24)
-    API_KEY=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+    ROOT_PASSWORD=$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 24)
+    WEBUI_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 40)
+    MYSQL_PORT=3306
+    WEBUI_PORT=8306
     cat > "$CONFIG_DIR/runalexdb.toml" << CONF
-# RunAlexDB configuration
-# Documentation: https://github.com/redlemonbe/RunAlexDB
-
-mysql_port = 3306
-webui_port = 8306
-bind       = "127.0.0.1"
+mysql_port = $MYSQL_PORT
+webui_port = $WEBUI_PORT
+bind       = "0.0.0.0"
 data_dir   = "$DATA_DIR"
 
-firewall_manage  = true
-firewall_backend = "auto"
-firewall_tag     = "runalexdb"
-
 [auth]
-root_password = "$ROOT_PASS"
-webui_api_key = "$API_KEY"
+root_password = "$ROOT_PASSWORD"
+webui_api_key = "$WEBUI_KEY"
+
+[xdp]
+enabled = false
 CONF
+    chown root:root "$CONFIG_DIR/runalexdb.toml"
+    chmod 640 "$CONFIG_DIR/runalexdb.toml"
     ok "Default config written to $CONFIG_DIR/runalexdb.toml"
-    info "Root password: $ROOT_PASS"
-    info "Web UI API key: $API_KEY"
-    info "Keep these safe — also stored in $CONFIG_DIR/runalexdb.toml"
+    info "Root password : $ROOT_PASSWORD"
+    info "Web UI API key: $WEBUI_KEY"
+    info "Keep them safe — they are in $CONFIG_DIR/runalexdb.toml"
 else
     info "Config already exists at $CONFIG_DIR/runalexdb.toml — skipping."
 fi
 
+# Write systemd unit
 cat > /etc/systemd/system/runalexdb.service << UNIT
 [Unit]
-Description=RunAlexDB — In-memory SQL database (MySQL wire protocol)
+Description=RunAlexDB — In-memory SQL database, MariaDB-compatible
 Documentation=https://github.com/redlemonbe/RunAlexDB
 After=network.target
 
@@ -110,14 +109,14 @@ After=network.target
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
-ExecStart=$PREFIX/bin/runalexdb --config $CONFIG_DIR/runalexdb.toml
+ExecStart=$PREFIX/bin/runalexdb $CONFIG_DIR/runalexdb.toml
 Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=$LOG_DIR $DATA_DIR $CONFIG_DIR
+ReadWritePaths=$DATA_DIR
 
 [Install]
 WantedBy=multi-user.target
@@ -128,16 +127,14 @@ systemctl enable runalexdb
 ok "systemd unit installed and enabled"
 
 if systemctl start runalexdb; then
-    ok "RunAlexDB started successfully"
-    VERSION_OUT=$("$PREFIX/bin/runalexdb" --version 2>/dev/null || echo "runalexdb v0.1.1")
+    ok "RunAlexDB started"
     echo
-    printf '%s\n' "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-    printf " Version:  %s\n" "$VERSION_OUT"
-    printf " MySQL:    mysql -h 127.0.0.1 -u root -p (port 3306)\n"
-    printf " Web UI:   http://YOUR_SERVER:8306\n"
-    printf " Config:   %s\n" "$CONFIG_DIR/runalexdb.toml"
-    printf " Logs:     journalctl -u runalexdb -f\n"
-    printf '%s\n' "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+    echo -e "${GREEN}Installation complete!${NC}"
+    echo -e "  Status:   systemctl status runalexdb"
+    echo -e "  Logs:     journalctl -u runalexdb -f"
+    echo -e "  MySQL:    mysql -h 127.0.0.1 -P 3306 -u root -p"
+    echo -e "  Web UI:   http://YOUR_SERVER:8306"
+    echo -e "  Config:   $CONFIG_DIR/runalexdb.toml"
 else
     warn "Service failed to start. Check: journalctl -u runalexdb"
 fi
