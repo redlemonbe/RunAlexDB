@@ -688,10 +688,124 @@ impl Engine {
                             }).sum::<i64>().to_string()
                         })
                     }
+                    "AVG" => {
+                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
+                        col_idx.and_then(|idx| {
+                            let nums: Vec<i64> = filtered.iter().filter_map(|r| r.get(idx))
+                                .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                                .collect();
+                            if nums.is_empty() { None }
+                            else { Some((nums.iter().sum::<i64>() / nums.len() as i64).to_string()) }
+                        })
+                    }
                     _ => Some("0".to_string()),
                 }
             }).collect();
             return QueryResult::rows(agg_cols, vec![agg_vals]);
+        }
+
+        // GROUP BY path
+        let group_by_cols: Vec<usize> = match &sel.group_by {
+            sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => {
+                exprs.iter().filter_map(|e| {
+                    let name = match e {
+                        Expr::Identifier(id) => id.value.clone(),
+                        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()).unwrap_or_default(),
+                        _ => return None,
+                    };
+                    table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&name))
+                }).collect()
+            }
+            _ => vec![],
+        };
+        if !group_by_cols.is_empty() {
+            let filtered: Vec<&Row> = table.rows.iter()
+                .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
+                .collect();
+            let mut groups: std::collections::BTreeMap<Vec<Option<String>>, Vec<&Row>> = std::collections::BTreeMap::new();
+            for row in &filtered {
+                let key: Vec<Option<String>> = group_by_cols.iter()
+                    .map(|&ci| row.get(ci).and_then(|v| v.to_display()))
+                    .collect();
+                groups.entry(key).or_default().push(row);
+            }
+            let out_cols: Vec<String> = sel.projection.iter().map(|p| {
+                match p {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    other => other.to_string(),
+                }
+            }).collect();
+            let eval_group_agg = |f: &sqlparser::ast::Function, rows: &Vec<&Row>| -> Option<String> {
+                let fname = f.name.to_string().to_uppercase();
+                let col_arg = f.args.to_string().trim().to_owned();
+                match fname.as_str() {
+                    "COUNT" => Some(rows.len().to_string()),
+                    "SUM" => {
+                        let ci = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg));
+                        ci.map(|ci| rows.iter().filter_map(|r| r.get(ci))
+                            .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                            .sum::<i64>().to_string())
+                    }
+                    "AVG" => {
+                        let ci = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg));
+                        ci.and_then(|ci| {
+                            let nums: Vec<i64> = rows.iter().filter_map(|r| r.get(ci))
+                                .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                                .collect();
+                            if nums.is_empty() { None }
+                            else { Some((nums.iter().sum::<i64>() / nums.len() as i64).to_string()) }
+                        })
+                    }
+                    "MAX" => {
+                        let ci = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg));
+                        ci.and_then(|ci| rows.iter().filter_map(|r| r.get(ci))
+                            .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                            .max().map(|v| v.to_string()))
+                    }
+                    "MIN" => {
+                        let ci = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg));
+                        ci.and_then(|ci| rows.iter().filter_map(|r| r.get(ci))
+                            .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                            .min().map(|v| v.to_string()))
+                    }
+                    _ => None,
+                }
+            };
+            let out_rows: Vec<Vec<Option<String>>> = groups.into_iter().filter_map(|(group_key, rows)| {
+                let row_vals: Vec<Option<String>> = sel.projection.iter().map(|p| {
+                    match p {
+                        SelectItem::UnnamedExpr(Expr::Function(f))
+                        | SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => {
+                            eval_group_agg(f, &rows)
+                        }
+                        SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
+                            let pos = group_by_cols.iter().enumerate()
+                                .find(|(_, &c)| table.columns[c].name.eq_ignore_ascii_case(&id.value))
+                                .map(|(pos, _)| pos);
+                            pos.and_then(|pos| group_key.get(pos).and_then(|v| v.clone()))
+                        }
+                        SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                            let name = parts.last().map(|i| i.value.clone()).unwrap_or_default();
+                            let pos = group_by_cols.iter().enumerate()
+                                .find(|(_, &c)| table.columns[c].name.eq_ignore_ascii_case(&name))
+                                .map(|(pos, _)| pos);
+                            pos.and_then(|pos| group_key.get(pos).and_then(|v| v.clone()))
+                        }
+                        _ => None,
+                    }
+                }).collect();
+                // HAVING filter
+                if let Some(having) = &sel.having {
+                    // Evaluate HAVING against the aggregate result — build a synthetic row
+                    // HAVING COUNT(*) > N: compare out_rows aggregate values
+                    // Simple implementation: only support HAVING COUNT(*) > N / = N
+                    let ok = eval_having_agg(having, rows.len());
+                    if !ok { return None; }
+                }
+                Some(row_vals)
+            }).collect();
+            return QueryResult::rows(out_cols, out_rows);
         }
 
         // Column projection
@@ -830,6 +944,13 @@ impl Engine {
         let result_rows: Vec<_> = result_rows.into_iter().skip(offset).collect();
         let result_rows: Vec<_> = if let Some(n) = limit {
             result_rows.into_iter().take(n).collect()
+        } else {
+            result_rows
+        };
+        // DISTINCT deduplication
+        let result_rows = if matches!(sel.distinct, Some(sqlparser::ast::Distinct::Distinct)) {
+            let mut seen = std::collections::HashSet::new();
+            result_rows.into_iter().filter(|r| seen.insert(r.clone())).collect()
         } else {
             result_rows
         };
@@ -1112,6 +1233,44 @@ fn like_match(value: &str, pattern: &str) -> bool {
         }
     }
     rec(&vi, &pi)
+}
+
+
+fn eval_having_agg(expr: &Expr, group_count: usize) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            // Evaluate left side as COUNT(*) or a literal
+            let lv = match left.as_ref() {
+                Expr::Function(f) if f.name.to_string().to_uppercase() == "COUNT" => {
+                    Value::Int(group_count as i64)
+                }
+                Expr::Value(vs) => match &vs.value {
+                    sqlparser::ast::Value::Number(n, _) => n.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
+                _ => Value::Null,
+            };
+            let rv = match right.as_ref() {
+                Expr::Value(vs) => match &vs.value {
+                    sqlparser::ast::Value::Number(n, _) => n.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
+                _ => Value::Null,
+            };
+            match op {
+                BinaryOperator::Eq    => values_eq(&lv, &rv),
+                BinaryOperator::NotEq => !values_eq(&lv, &rv),
+                BinaryOperator::Gt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Greater,
+                BinaryOperator::GtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Less,
+                BinaryOperator::Lt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Less,
+                BinaryOperator::LtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Greater,
+                BinaryOperator::And   => eval_having_agg(left, group_count) && eval_having_agg(right, group_count),
+                BinaryOperator::Or    => eval_having_agg(left, group_count) || eval_having_agg(right, group_count),
+                _ => true,
+            }
+        }
+        _ => true,
+    }
 }
 
 fn eval_where(row: &Row, cols: &[Column], expr: &Expr) -> bool {
