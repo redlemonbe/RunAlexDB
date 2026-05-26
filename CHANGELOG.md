@@ -1,5 +1,23 @@
 # Changelog — RunAlexDB
 
+## [0.1.3] — 2026-05-26
+
+### Added
+
+- **WHERE clause**: Full expression evaluator — `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `LIKE` (% and _ wildcards), `BETWEEN`, `IN (...)`.
+- **Column projection**: `SELECT col1, col2 FROM table` — previously only `SELECT *` was supported. Alias supported: `SELECT col AS alias`.
+- **ORDER BY**: `ORDER BY col [ASC|DESC]`. Numeric columns sorted numerically.
+- **LIMIT / OFFSET**: `SELECT ... LIMIT n OFFSET m`.
+- **UPDATE**: `UPDATE table SET col = val [WHERE ...]` — returns affected row count.
+- **DELETE**: `DELETE FROM table [WHERE ...]` — returns affected row count.
+
+### Fixed
+
+- Aggregate match patterns corrected to string literals (`"COUNT"`, `"MAX"`, `"MIN"`, `"SUM"`) — bare identifiers caused COUNT to always match first regardless of function name.
+- Aggregates respect WHERE filter when present.
+
+---
+
 ## [0.1.2] — 2026-05-26
 
 ### Security

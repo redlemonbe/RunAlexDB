@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock};
 
 use anyhow::{bail, Result};
 use sqlparser::ast::{
-    ColumnDef, Expr, ObjectName, Query, SetExpr, Statement, Values,
+    Assignment, BinaryOperator, ColumnDef, Expr, ObjectName,
+    Query, SelectItem, SetExpr, Statement, UnaryOperator, Values,
 };
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::Parser;
@@ -176,6 +177,20 @@ impl Engine {
                 let _ = (object_type, names); // TODO
                 QueryResult::ok(0, 0)
             }
+            Statement::Update { table, assignments, selection, .. } => {
+                let db_name = current_db.as_deref().unwrap_or("test");
+                self.update(db_name, &table.relation.to_string(), assignments, selection.as_ref())
+            }
+            Statement::Delete(del) => {
+                let db_name = current_db.as_deref().unwrap_or("test");
+                let table_name = match &del.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables)
+                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
+                        tables.first().map(|t| t.relation.to_string()).unwrap_or_default()
+                    }
+                };
+                self.delete(db_name, &table_name, del.selection.as_ref())
+            }
             Statement::Use(u) => {
                 // USE db just returns OK — the session tracks current_db
                 let _ = u;
@@ -284,22 +299,18 @@ impl Engine {
     }
 
     fn select(&self, db_name: &str, query: Query) -> QueryResult {
-        // Very basic SELECT — only handles SELECT * FROM table and SELECT expr
         let SetExpr::Select(sel) = *query.body else {
             return QueryResult::err(1295, "Complex SELECT not yet supported");
         };
 
         if sel.from.is_empty() {
-            // SELECT without FROM — evaluate projection
             let cols: Vec<String> = sel.projection.iter().map(|p| p.to_string()).collect();
             let vals: Vec<Option<String>> = sel.projection.iter().map(|p| {
                 match p {
-                    sqlparser::ast::SelectItem::UnnamedExpr(Expr::Value(ref vs)) => {
+                    SelectItem::UnnamedExpr(Expr::Value(ref vs)) => {
                         Some(vs.value.to_string().trim_matches('\'').to_owned())
                     }
-                    sqlparser::ast::SelectItem::UnnamedExpr(Expr::Function(f)) => {
-                        Some(f.to_string())
-                    }
+                    SelectItem::UnnamedExpr(Expr::Function(f)) => Some(f.to_string()),
                     _ => Some(p.to_string()),
                 }
             }).collect();
@@ -322,76 +333,333 @@ impl Engine {
             return QueryResult::err(1146, &format!("Table '{db_name}.{table_name}' doesn't exist"));
         };
 
-        // Check for aggregate-only projection (e.g. SELECT COUNT(*), COUNT(*) as n, MAX(id))
-        let is_aggregate_only = sel.projection.iter().all(|p| {
-            match p {
-                sqlparser::ast::SelectItem::UnnamedExpr(Expr::Function(_))
-                | sqlparser::ast::SelectItem::ExprWithAlias { expr: Expr::Function(_), .. } => true,
-                _ => false,
-            }
+        // Aggregate-only projection
+        let is_aggregate_only = !sel.projection.is_empty() && sel.projection.iter().all(|p| {
+            matches!(p,
+                SelectItem::UnnamedExpr(Expr::Function(_))
+                | SelectItem::ExprWithAlias { expr: Expr::Function(_), .. })
         });
 
-        if is_aggregate_only && !sel.projection.is_empty() {
+        if is_aggregate_only {
+            // Filter first if WHERE present
+            let filtered: Vec<&Row> = table.rows.iter()
+                .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
+                .collect();
+
             let agg_cols: Vec<String> = sel.projection.iter().map(|p| {
                 match p {
-                    sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
                     other => other.to_string(),
                 }
             }).collect();
             let agg_vals: Vec<Option<String>> = sel.projection.iter().map(|p| {
                 let func = match p {
-                    sqlparser::ast::SelectItem::UnnamedExpr(Expr::Function(f)) => f,
-                    sqlparser::ast::SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => f,
+                    SelectItem::UnnamedExpr(Expr::Function(f)) => f,
+                    SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => f,
                     _ => return None,
                 };
                 let fname = func.name.to_string().to_uppercase();
                 match fname.as_str() {
-                    "COUNT" => Some(table.rows.len().to_string()),
+                    "COUNT" => Some(filtered.len().to_string()),
                     "MAX" => {
-                        // Get column name from first arg
                         let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
-                        let max_val = col_idx.and_then(|idx| {
-                            table.rows.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
+                        col_idx.and_then(|idx| {
+                            filtered.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
                                 if let Value::Int(n) = v { Some(*n) } else { None }
-                            }).max()
-                        });
-                        max_val.map(|v| v.to_string())
+                            }).max().map(|v| v.to_string())
+                        })
                     }
                     "MIN" => {
                         let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
-                        let min_val = col_idx.and_then(|idx| {
-                            table.rows.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
+                        col_idx.and_then(|idx| {
+                            filtered.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
                                 if let Value::Int(n) = v { Some(*n) } else { None }
-                            }).min()
-                        });
-                        min_val.map(|v| v.to_string())
+                            }).min().map(|v| v.to_string())
+                        })
                     }
                     "SUM" => {
                         let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
-                        let sum_val = col_idx.map(|idx| {
-                            table.rows.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
+                        col_idx.map(|idx| {
+                            filtered.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
                                 if let Value::Int(n) = v { Some(*n) } else { None }
-                            }).sum::<i64>()
-                        });
-                        sum_val.map(|v| v.to_string())
+                            }).sum::<i64>().to_string()
+                        })
                     }
-                    _ => Some(0.to_string()),
+                    _ => Some("0".to_string()),
                 }
             }).collect();
             return QueryResult::rows(agg_cols, vec![agg_vals]);
         }
 
-        let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
-        let result_rows: Vec<Vec<Option<String>>> = table.rows.iter().map(|row| {
-            row.iter().map(|v| v.to_display()).collect()
-        }).collect();
+        // Column projection
+        let proj_cols: Vec<(String, usize)> = if sel.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))) {
+            table.columns.iter().enumerate().map(|(i, c)| (c.name.clone(), i)).collect()
+        } else {
+            sel.projection.iter().filter_map(|p| {
+                let col_name = match p {
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.clone(),
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                        parts.last().map(|i| i.value.clone()).unwrap_or_default()
+                    }
+                    SelectItem::ExprWithAlias { alias, expr: Expr::Identifier(id), .. } => {
+                        let _ = id;
+                        alias.value.clone()
+                    }
+                    _ => return None,
+                };
+                // Find index by original name (even if aliased)
+                let orig_name = match p {
+                    SelectItem::ExprWithAlias { expr: Expr::Identifier(id), .. } => id.value.clone(),
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.clone(),
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                        parts.last().map(|i| i.value.clone()).unwrap_or_default()
+                    }
+                    _ => col_name.clone(),
+                };
+                let idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&orig_name))?;
+                Some((col_name, idx))
+            }).collect()
+        };
+
+        let col_names: Vec<String> = proj_cols.iter().map(|(n, _)| n.clone()).collect();
+
+        // Filter by WHERE
+        let mut result_rows: Vec<Vec<Option<String>>> = table.rows.iter()
+            .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
+            .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
+            .collect();
+
+        // ORDER BY
+        if let Some(ob) = &query.order_by {
+            if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+                for order_expr in exprs.iter().rev() {
+                    let col_name = order_expr.expr.to_string();
+                    if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                        let asc = order_expr.options.asc.unwrap_or(true);
+                        let proj_idx = proj_cols.iter().position(|(_, i)| *i == idx);
+                        if let Some(pidx) = proj_idx {
+                            result_rows.sort_by(|a, b| {
+                                let av = a.get(pidx).and_then(|x| x.as_deref());
+                                let bv = b.get(pidx).and_then(|x| x.as_deref());
+                                let ord = match (av, bv) {
+                                    (Some(x), Some(y)) => {
+                                        match (x.parse::<i64>(), y.parse::<i64>()) {
+                                            (Ok(xi), Ok(yi)) => xi.cmp(&yi),
+                                            _ => x.cmp(y),
+                                        }
+                                    }
+                                    (None, Some(_)) => std::cmp::Ordering::Less,
+                                    (Some(_), None) => std::cmp::Ordering::Greater,
+                                    (None, None) => std::cmp::Ordering::Equal,
+                                };
+                                if asc { ord } else { ord.reverse() }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // LIMIT / OFFSET
+        let offset = query.offset.as_ref().and_then(|o| {
+            if let Expr::Value(ref v) = o.value {
+                v.value.to_string().parse::<usize>().ok()
+            } else { None }
+        }).unwrap_or(0);
+        let limit = query.limit.as_ref().and_then(|l| {
+            if let Expr::Value(ref v) = l {
+                v.value.to_string().parse::<usize>().ok()
+            } else { None }
+        });
+
+        let result_rows: Vec<_> = result_rows.into_iter().skip(offset).collect();
+        let result_rows: Vec<_> = if let Some(n) = limit {
+            result_rows.into_iter().take(n).collect()
+        } else {
+            result_rows
+        };
 
         QueryResult::rows(col_names, result_rows)
     }
+
+    fn update(&self, db_name: &str, table_name: &str, assignments: Vec<Assignment>, selection: Option<&Expr>) -> QueryResult {
+        let (eff_db, eff_table) = if let Some(dot) = table_name.find('.') {
+            (table_name[..dot].trim_matches('`').to_owned(), table_name[dot+1..].trim_matches('`').to_owned())
+        } else {
+            (db_name.to_owned(), table_name.trim_matches('`').to_owned())
+        };
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let Some(db_arc) = dbs.get(&eff_db) else {
+            return QueryResult::err(1049, &format!("Unknown database '{eff_db}'"));
+        };
+        let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+        let Some(table) = db.tables.get_mut(&eff_table) else {
+            return QueryResult::err(1146, &format!("Table '{eff_db}.{eff_table}' doesn't exist"));
+        };
+
+        let mut affected = 0u64;
+        for row in table.rows.iter_mut() {
+            if selection.map_or(true, |w| eval_where(row, &table.columns, w)) {
+                for asgn in &assignments {
+                    let col_name = asgn.target.to_string();
+                    if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
+                        row[idx] = expr_to_value(asgn.value.clone());
+                    }
+                }
+                affected += 1;
+            }
+        }
+        QueryResult::ok(affected, 0)
+    }
+
+    fn delete(&self, db_name: &str, table_name: &str, selection: Option<&Expr>) -> QueryResult {
+        let (eff_db, eff_table) = if let Some(dot) = table_name.find('.') {
+            (table_name[..dot].trim_matches('`').to_owned(), table_name[dot+1..].trim_matches('`').to_owned())
+        } else {
+            (db_name.to_owned(), table_name.trim_matches('`').to_owned())
+        };
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let Some(db_arc) = dbs.get(&eff_db) else {
+            return QueryResult::err(1049, &format!("Unknown database '{eff_db}'"));
+        };
+        let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+        let Some(table) = db.tables.get_mut(&eff_table) else {
+            return QueryResult::err(1146, &format!("Table '{eff_db}.{eff_table}' doesn't exist"));
+        };
+
+        let before = table.rows.len();
+        table.rows.retain(|row| {
+            selection.map_or(false, |w| !eval_where(row, &table.columns, w))
+        });
+        let affected = (before - table.rows.len()) as u64;
+        QueryResult::ok(affected, 0)
+    }
 }
+
+// ── WHERE evaluator ────────────────────────────────────────────────────────
+
+fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
+    match expr {
+        Expr::Value(vs) => expr_to_value(Expr::Value(vs.clone())),
+        Expr::Identifier(id) => {
+            cols.iter().position(|c| c.name.eq_ignore_ascii_case(&id.value))
+                .and_then(|idx| row.get(idx).cloned())
+                .unwrap_or(Value::Null)
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let Some(last) = parts.last() {
+                cols.iter().position(|c| c.name.eq_ignore_ascii_case(&last.value))
+                    .and_then(|idx| row.get(idx).cloned())
+                    .unwrap_or(Value::Null)
+            } else { Value::Null }
+        }
+        _ => Value::Null,
+    }
+}
+
+fn values_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Float(x), Value::Float(y)) => x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Int(x), Value::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Float(x), Value::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(std::cmp::Ordering::Equal),
+        (Value::Text(x), Value::Text(y)) => x.cmp(y),
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Less,
+        (_, Value::Null) => std::cmp::Ordering::Greater,
+        _ => {
+            let xs = a.to_display().unwrap_or_default();
+            let ys = b.to_display().unwrap_or_default();
+            xs.cmp(&ys)
+        }
+    }
+}
+
+fn values_eq(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        _ => values_cmp(a, b) == std::cmp::Ordering::Equal,
+    }
+}
+
+fn like_match(value: &str, pattern: &str) -> bool {
+    // Simple LIKE — % = any sequence, _ = one char
+    let vi = value.chars().collect::<Vec<_>>();
+    let pi = pattern.chars().collect::<Vec<_>>();
+    fn rec(v: &[char], p: &[char]) -> bool {
+        if p.is_empty() { return v.is_empty(); }
+        if p[0] == '%' {
+            // Skip consecutive %
+            let next_p = &p[1..];
+            for i in 0..=v.len() {
+                if rec(&v[i..], next_p) { return true; }
+            }
+            false
+        } else if p[0] == '_' {
+            !v.is_empty() && rec(&v[1..], &p[1..])
+        } else {
+            !v.is_empty() && p[0].to_lowercase().eq(v[0].to_lowercase()) && rec(&v[1..], &p[1..])
+        }
+    }
+    rec(&vi, &pi)
+}
+
+fn eval_where(row: &Row, cols: &[Column], expr: &Expr) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinaryOperator::And => {
+                    return eval_where(row, cols, left) && eval_where(row, cols, right);
+                }
+                BinaryOperator::Or => {
+                    return eval_where(row, cols, left) || eval_where(row, cols, right);
+                }
+                _ => {}
+            }
+            let l = eval_row_expr(row, cols, left);
+            let r = eval_row_expr(row, cols, right);
+            match op {
+                BinaryOperator::Eq      => values_eq(&l, &r),
+                BinaryOperator::NotEq   => !values_eq(&l, &r),
+                BinaryOperator::Lt      => values_cmp(&l, &r) == std::cmp::Ordering::Less,
+                BinaryOperator::LtEq    => values_cmp(&l, &r) != std::cmp::Ordering::Greater,
+                BinaryOperator::Gt      => values_cmp(&l, &r) == std::cmp::Ordering::Greater,
+                BinaryOperator::GtEq    => values_cmp(&l, &r) != std::cmp::Ordering::Less,
+                _ => true,
+            }
+        }
+        Expr::IsNull(e) => matches!(eval_row_expr(row, cols, e), Value::Null),
+        Expr::IsNotNull(e) => !matches!(eval_row_expr(row, cols, e), Value::Null),
+        Expr::Like { expr, pattern, negated, .. } => {
+            let val = eval_row_expr(row, cols, expr);
+            let pat = eval_row_expr(row, cols, pattern);
+            if let (Some(v), Some(p)) = (val.as_str(), pat.as_str()) {
+                let m = like_match(v, p);
+                if *negated { !m } else { m }
+            } else { false }
+        }
+        Expr::Nested(e) => eval_where(row, cols, e),
+        Expr::UnaryOp { op: UnaryOperator::Not, expr } => !eval_where(row, cols, expr),
+        Expr::Between { expr, low, high, negated } => {
+            let v = eval_row_expr(row, cols, expr);
+            let lo = eval_row_expr(row, cols, low);
+            let hi = eval_row_expr(row, cols, high);
+            let in_range = values_cmp(&v, &lo) != std::cmp::Ordering::Less
+                && values_cmp(&v, &hi) != std::cmp::Ordering::Greater;
+            if *negated { !in_range } else { in_range }
+        }
+        Expr::InList { expr, list, negated } => {
+            let v = eval_row_expr(row, cols, expr);
+            let found = list.iter().any(|item| values_eq(&v, &eval_row_expr(row, cols, item)));
+            if *negated { !found } else { found }
+        }
+        _ => true,
+    }
+}
+
 
 // ── QueryResult ────────────────────────────────────────────────────────────
 

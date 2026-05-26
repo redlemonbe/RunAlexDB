@@ -148,19 +148,25 @@ Set `firewall_manage = false` to manage rules manually.
 
 ## SQL coverage
 
-Current:
+Current (v0.1.3+):
 - `CREATE DATABASE`, `DROP DATABASE`
 - `CREATE TABLE`, `DROP TABLE`
 - `INSERT INTO ... VALUES`
-- `SELECT * FROM table`, `SELECT expr` (no FROM)
-- `SELECT COUNT(*), MAX(col), MIN(col), SUM(col)` aggregates
+- `SELECT * FROM table`, `SELECT col1, col2 FROM table`
+- `SELECT ... WHERE col = val` — operators: `=`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, `IS NULL`, `IS NOT NULL`, `LIKE`, `BETWEEN`, `IN (...)`
+- `SELECT COUNT(*), MAX(col), MIN(col), SUM(col)` aggregates (with WHERE support)
+- `ORDER BY col [ASC|DESC]`
+- `LIMIT n [OFFSET m]`
+- `UPDATE table SET col = val [WHERE ...]`
+- `DELETE FROM table [WHERE ...]`
 - `SHOW DATABASES`, `SHOW TABLES`
 - `USE db`
 
 Roadmap (see [GitHub Issues](https://github.com/redlemonbe/RunAlexDB/issues)):
-- WHERE / JOIN / UPDATE / DELETE
+- JOIN / subqueries
 - WAL + B-Tree persistence
 - TLS for client connections
+- INFORMATION_SCHEMA compatibility
 - Master/slave replication
 
 ---
