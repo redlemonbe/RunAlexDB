@@ -6,6 +6,7 @@ use tokio::sync::Semaphore;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
 
 use anyhow::Result;
+use tokio::time::timeout;
 use bytes::BytesMut;
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
@@ -299,9 +300,14 @@ where
     let mut l0_hash: u64 = 0;
     let mut l0_gen:  u64 = u64::MAX; // initialise to invalid
     let mut l0_bytes: Option<bytes::Bytes> = None;
+    let idle_timeout = std::time::Duration::from_secs(cfg.connection_timeout_secs);
     loop {
         if buf.is_empty() {
-            let n = stream.read_buf(&mut buf).await?;
+            let n = match timeout(idle_timeout, stream.read_buf(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => return Ok(()), // idle timeout — close connection silently
+            };
             if n == 0 { return Ok(()); }
         }
 
@@ -400,7 +406,11 @@ where
             }
         }
 
-        let n = stream.read_buf(&mut buf).await?;
+        let n = match timeout(idle_timeout, stream.read_buf(&mut buf)).await {
+            Ok(Ok(n)) => n,
+            Ok(Err(e)) => return Err(e.into()),
+            Err(_) => return Ok(()),
+        };
         if n == 0 { return Ok(()); }
     }
 }

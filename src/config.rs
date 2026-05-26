@@ -32,6 +32,12 @@ pub struct Config {
     pub firewall_tag:     String,
     #[serde(default = "default_icmp_protection")]
     pub icmp_protection: bool,
+
+    #[serde(default = "default_connection_timeout_secs")]
+    pub connection_timeout_secs: u64,
+
+    #[serde(default = "default_handshake_timeout_secs")]
+    pub handshake_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -105,8 +111,12 @@ impl Default for Config {
             firewall_backend: None,
             firewall_tag:     default_fw_tag(),
             icmp_protection: default_icmp_protection(),
+            connection_timeout_secs: default_connection_timeout_secs(),
+            handshake_timeout_secs: default_handshake_timeout_secs(),
         }
     }
 }
 
 fn default_icmp_protection() -> bool { true }
+fn default_connection_timeout_secs() -> u64 { 300 }
+fn default_handshake_timeout_secs() -> u64 { 10 }
