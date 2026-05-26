@@ -346,8 +346,8 @@ impl Engine {
                 };
                 let fname = func.name.to_string().to_uppercase();
                 match fname.as_str() {
-                    COUNT => Some(table.rows.len().to_string()),
-                    MAX => {
+                    "COUNT" => Some(table.rows.len().to_string()),
+                    "MAX" => {
                         // Get column name from first arg
                         let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
@@ -358,7 +358,7 @@ impl Engine {
                         });
                         max_val.map(|v| v.to_string())
                     }
-                    MIN => {
+                    "MIN" => {
                         let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
                         let min_val = col_idx.and_then(|idx| {
@@ -368,7 +368,7 @@ impl Engine {
                         });
                         min_val.map(|v| v.to_string())
                     }
-                    SUM => {
+                    "SUM" => {
                         let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
                         let sum_val = col_idx.map(|idx| {

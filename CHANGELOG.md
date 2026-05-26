@@ -1,5 +1,18 @@
 # Changelog — RunAlexDB
 
+## [0.1.2] — 2026-05-26
+
+### Security
+
+- **B-002 fixed**: WebUI API key comparison now uses `subtle::ConstantTimeEq::ct_eq()` — prevents timing side-channel — closes #20.
+- **B-003 fixed**: MySQL listener bounded to 256 concurrent sessions via `tokio::sync::Semaphore` — prevents connection-storm DoS — closes #21.
+
+### Fixed
+
+- Aggregate function match patterns changed from bare identifiers to string literals (`"COUNT"`, `"MAX"`, `"MIN"`, `"SUM"`).
+
+---
+
 ## [0.1.1] — 2026-05-26
 
 ### Added

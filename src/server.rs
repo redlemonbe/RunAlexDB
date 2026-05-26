@@ -1,6 +1,7 @@
 //! MySQL wire protocol server — TCP listener, session handler.
 
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use std::net::SocketAddr;
 
 use anyhow::Result;
@@ -17,17 +18,29 @@ use crate::protocol::{
     server_greeting, text_row, Command,
 };
 
+const MAX_CONNECTIONS: usize = 256;
+
 pub async fn run(cfg: Config, db: Arc<Engine>) -> Result<()> {
     let addr = format!("{}:{}", cfg.bind, cfg.mysql_port);
     let listener = TcpListener::bind(&addr).await?;
-    info!("MySQL listener on {addr}");
+    info!("MySQL listener on {addr} (max {} concurrent connections)", MAX_CONNECTIONS);
+
+    let sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
+                let permit = match Arc::clone(&sem).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!("connection limit reached ({MAX_CONNECTIONS}), rejecting {peer}");
+                        continue;
+                    }
+                };
                 let db = Arc::clone(&db);
                 let cfg = cfg.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(e) = handle_connection(stream, peer, db, cfg).await {
                         debug!("session {peer} closed: {e}");
                     }
