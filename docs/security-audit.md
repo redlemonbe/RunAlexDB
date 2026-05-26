@@ -407,11 +407,75 @@ This is not a bug in RunAlexDB's implementation — the SHA1 scramble/XOR dance 
 
 ---
 
-## Updated Known Limitations and Accepted Risks (post Cycle B)
+
+---
+
+## Cycle C — [AI-INTERNAL] — 2026-05-26 — v0.2.3 (deadlock fixes, ICMP guard, prepared statements)
+
+**Scope:** Auth loop deadlock, command loop deadlock, prepared statement parameter substitution, ICMP guard, SQL injection via prepared statements.
+
+### C-001 — HIGH — Auth loop deadlock (FIXED)
+
+| Field | Value |
+|-------|-------|
+| **Severity** | HIGH |
+| **CWE** | CWE-833 (Deadlock) |
+| **Discovered** | 2026-05-26 (functional test) |
+| **Status** | Fixed — v0.2.3, commit 544b268 |
+
+Description: run_authenticated_session() called read_buf() unconditionally at loop start, even when buf already contained the full HandshakeResponse41 pre-read by the TCP listener. Client sent its auth packet and waited for OK/ERR; server blocked waiting for more network data. Result: every connection from standard MySQL clients (pymysql, MariaDB) timed out. Auth was never evaluated.
+
+Fix: added if buf.is_empty() guard before read_buf() in the auth loop.
+
+---
+
+### C-002 — HIGH — Command loop deadlock (FIXED)
+
+| Field | Value |
+|-------|-------|
+| **Severity** | HIGH |
+| **CWE** | CWE-833 (Deadlock) |
+| **Discovered** | 2026-05-26 (functional test) |
+| **Status** | Fixed — v0.2.3, commit 544b268 |
+
+Description: The command loop's else branch (triggered when buf had leftover data) called read_buf() which blocks until new network data arrives, preventing processing of commands already buffered. Caused hangs on any multi-packet exchange.
+
+Fix: removed else branch entirely. Loop now always checks buf.is_empty() before reading from network.
+
+---
+
+### C-003 — INFO — Prepared statement parameter substitution: no injection vector
+
+| Field | Value |
+|-------|-------|
+| **Severity** | INFO |
+| **Discovered** | 2026-05-26 |
+| **Status** | No finding |
+
+Description: String parameters are escaped as v.replace("'", "''") (SQL standard). Numeric parameters are validated via f64::parse() — only valid numbers pass unquoted. Verified via pymysql with injection payloads ("1; DROP TABLE users; --", "alice'--"). Table survived, no injection occurred.
+
+---
+
+### C-004 — LOW — MAX/MIN aggregates on INT columns return NULL
+
+| Field | Value |
+|-------|-------|
+| **Severity** | LOW |
+| **CWE** | CWE-682 (Incorrect Calculation) |
+| **Discovered** | 2026-05-26 |
+| **Status** | Open |
+
+Description: Values are stored as Option<String> in-memory. MAX/MIN use string comparison. On INTEGER columns, MAX(1, 2) returns "2" (correct by coincidence for single-digit), but any numeric ordering beyond lexicographic breaks. Observed: MAX(id) returns None when ids are integers.
+
+Impact: Functional only, no security impact. Alpha product limitation.
+
+---
+
+## Updated Known Limitations and Accepted Risks (post Cycle C)
 
 | # | Risk | Cycle | Status |
 |---|------|-------|--------|
-| 1 | No [HUMAN-EXTERNAL] audit performed | A | Open |
+| 1 | No HUMAN-EXTERNAL audit performed | A | Open |
 | 2 | In-memory storage — data lost on restart | A | Accepted (alpha) |
 | 3 | No TLS on MySQL or web UI ports | A | Accepted (alpha) |
 | 4 | Single-read HTTP body (65 536 byte limit) | B | Open (B-001) |
@@ -421,10 +485,13 @@ This is not a bug in RunAlexDB's implementation — the SHA1 scramble/XOR dance 
 | 8 | SQL coverage minimal (no WHERE/JOIN/UPDATE/DELETE) | A | Accepted (alpha) |
 | 9 | No rate limiting on MySQL port | A | Open |
 | 10 | sqlparser crate not audited | A | Open |
+| 11 | Auth + command loop deadlocks | C | Fixed (C-001, C-002) |
+| 12 | MAX/MIN numeric ordering incorrect | C | Open (C-004) |
 
 ## Audit trail (updated)
 
 | Cycle | Date | Source | Model | Scope |
 |-------|------|--------|-------|-------|
-| A | 2026-05-26 | [AI-INTERNAL] | Claude Sonnet 4.6 | protocol, auth, engine, webui, server |
-| B | 2026-05-26 | [AI-INTERNAL] | Claude Sonnet 4.6 | webui (full), server (command loop), auth, protocol, engine re-review |
+| A | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | protocol, auth, engine, webui, server |
+| B | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | webui (full), server (command loop), auth, protocol, engine |
+| C | 2026-05-26 | AI-INTERNAL | Claude Sonnet 4.6 | deadlocks (fixed), prepared stmt injection, ICMP guard, MAX/MIN |
