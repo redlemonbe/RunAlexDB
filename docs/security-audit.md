@@ -161,7 +161,7 @@ Claude Sonnet 4.6 (2026-05-26). This audit has not been re-reviewed by a differe
 | **Source** | [AI-INTERNAL] |
 | **File** | `src/webui.rs` — `extract_json_str()` function |
 | **Discovered** | 2026-05-26 |
-| **Status** | ⏳ Open |
+| **Status** | ✅ Fixed — v0.1.0+, commit 7ad60bc — closes #14 |
 
 **Threat model:** Authenticated attacker sending crafted JSON to `/api/query`.
 
@@ -215,7 +215,7 @@ Depending on which match the function finds first, the wrong SQL string may be e
 | **Source** | [AI-INTERNAL] |
 | **File** | `src/webui.rs` — `http_response()` helper |
 | **Discovered** | 2026-05-26 |
-| **Status** | ⏳ Open |
+| **Status** | ✅ Fixed — v0.1.0+, commit 7ad60bc — closes #15 |
 
 **Description:** All web UI responses include `Access-Control-Allow-Origin: *`. This allows any web page to make cross-origin requests to the admin UI. Combined with a logged-in user (cookie-based or header-based auth), a malicious page visited by an admin could issue API calls.
 
@@ -238,7 +238,7 @@ The current auth is header-based (`X-API-Key`), not cookie-based. Browsers do no
 | **Source** | [AI-INTERNAL] |
 | **File** | `src/engine.rs` — all `unwrap()` on `RwLock` |
 | **Discovered** | 2026-05-26 |
-| **Status** | ⏳ Open |
+| **Status** | ✅ Mitigated — v0.1.0+, commit 7ad60bc — closes #16. Lock recovery via `unwrap_or_else`. |
 
 **Description:** All lock acquisitions in the engine use `.unwrap()`. If any thread panics while holding a read or write lock, the lock becomes poisoned. The next `unwrap()` on that lock panics, crashing the Tokio task — and potentially the entire server depending on the panic handler configuration.
 
