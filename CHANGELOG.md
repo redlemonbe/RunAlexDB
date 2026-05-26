@@ -1,5 +1,18 @@
 # Changelog — RunAlexDB
 
+## [0.1.5] — 2026-05-26
+
+### Added
+
+- **Hot backup**: `POST /api/backup` — dumps all databases to `data_dir/backups/backup_<ts>[_label].sql`. Optional `label` field for named snapshots.
+- **Backup listing**: `GET /api/backups` — returns JSON list of available backups with id, size, and timestamp.
+- **Hot restore**: `POST /api/restore` with `{"id": "backup_<ts>.sql"}` — reloads all databases from a backup file while the server stays running.
+- **Backup deletion**: `DELETE /api/backups/<id>` — removes a named backup file.
+- **Auto-persist on shutdown**: on SIGTERM or Ctrl-C, full SQL dump is written to `data_dir/runalexdb.sql` before exit.
+- **Auto-load on startup**: if `data_dir/runalexdb.sql` exists, it is loaded automatically at startup — data survives restarts without manual restore.
+
+---
+
 ## [0.1.4] — 2026-05-26
 
 ### Added

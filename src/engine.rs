@@ -97,7 +97,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(_cfg: &Config) -> Self {
+    pub fn new(cfg: &Config) -> Self {
         let mut dbs = HashMap::new();
         // Built-in schemas
         for name in &["information_schema", "performance_schema", "mysql", "sys", "test"] {
@@ -106,7 +106,16 @@ impl Engine {
                 tables: HashMap::new(),
             })));
         }
-        Self { databases: RwLock::new(dbs) }
+        let engine = Self { databases: RwLock::new(dbs) };
+
+        // Auto-load persisted data on startup
+        let persist_path = format!("{}/runalexdb.sql", cfg.data_dir);
+        if let Ok(sql) = std::fs::read_to_string(&persist_path) {
+            tracing::info!("Loading persisted data from {persist_path}");
+            engine.restore_sql(&sql);
+        }
+
+        engine
     }
 
     /// Execute a SQL statement string in the context of `current_db`.
@@ -648,6 +657,84 @@ impl Engine {
         });
         let affected = (before - table.rows.len()) as u64;
         QueryResult::ok(affected, 0)
+    }
+
+    /// Generate a SQL dump of all user databases (excludes system schemas).
+    pub fn dump_sql(&self) -> String {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let system_dbs = ["information_schema", "performance_schema", "mysql", "sys", "test"];
+        let mut out = String::new();
+        out.push_str("-- RunAlexDB SQL dump\n");
+        out.push_str(&format!("-- Generated: unix_ts={}\n\n", ts));
+
+        for (db_name, db_arc) in dbs.iter() {
+            if system_dbs.contains(&db_name.as_str()) { continue; }
+            out.push_str(&format!("CREATE DATABASE IF NOT EXISTS `{}`;\n", db_name));
+            out.push_str(&format!("USE `{}`;\n\n", db_name));
+
+            let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+            for (tname, table) in &db.tables {
+                out.push_str(&format!("CREATE TABLE IF NOT EXISTS `{}` (\n", tname));
+                let col_defs: Vec<String> = table.columns.iter().map(|c| {
+                    let type_str: String = match &c.col_type {
+                        ColumnType::Int => "INT".into(),
+                        ColumnType::BigInt => "BIGINT".into(),
+                        ColumnType::Float => "DOUBLE".into(),
+                        ColumnType::VarChar(n) => format!("VARCHAR({})", n),
+                        ColumnType::Text => "TEXT".into(),
+                        ColumnType::Blob => "BLOB".into(),
+                        ColumnType::Timestamp => "TIMESTAMP".into(),
+                    };
+                    let pk = if c.primary_key { " PRIMARY KEY" } else { "" };
+                    format!("  `{}` {}{}", c.name, type_str, pk)
+                }).collect();
+                out.push_str(&col_defs.join(",\n"));
+                out.push_str("\n);\n\n");
+
+                if !table.rows.is_empty() {
+                    let col_names: Vec<String> = table.columns.iter().map(|c| format!("`{}`", c.name)).collect();
+                    out.push_str(&format!("INSERT INTO `{}` ({}) VALUES\n", tname, col_names.join(", ")));
+                    let row_strs: Vec<String> = table.rows.iter().map(|row| {
+                        let vals: Vec<String> = row.iter().map(|v| match v {
+                            Value::Null => "NULL".into(),
+                            Value::Int(i) => i.to_string(),
+                            Value::Float(f) => f.to_string(),
+                            Value::Text(s) => format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'")),
+                            Value::Bytes(b) => format!("X'{}'", hex::encode(b)),
+                        }).collect();
+                        format!("  ({})", vals.join(", "))
+                    }).collect();
+                    out.push_str(&row_strs.join(",\n"));
+                    out.push_str(";\n\n");
+                }
+            }
+        }
+        out
+    }
+
+    /// Restore from a SQL dump. Executes each statement sequentially.
+    pub fn restore_sql(&self, sql_dump: &str) {
+        let mut current_db: Option<String> = None;
+        let mut batch = String::new();
+        for line in sql_dump.lines() {
+            let line = line.trim();
+            if line.starts_with("--") || line.is_empty() { continue; }
+            batch.push_str(line);
+            batch.push(' ');
+            if line.ends_with(';') {
+                let stmt = batch.trim().to_owned();
+                batch.clear();
+                let upper = stmt.to_uppercase();
+                if upper.starts_with("USE ") {
+                    let db_name = stmt[4..].trim().trim_end_matches(';').trim_matches('`').to_owned();
+                    current_db = Some(db_name);
+                    continue;
+                }
+                let _ = self.execute(&stmt, &current_db);
+            }
+        }
     }
 }
 

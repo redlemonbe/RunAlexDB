@@ -34,14 +34,35 @@ async fn main() -> Result<()> {
     ));
     fw.open(&fw_ports);
     let fw_cleanup = std::sync::Arc::clone(&fw);
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        fw_cleanup.close();
-        std::process::exit(0);
-    });
 
     // Start MySQL listener and web UI concurrently
     let db = std::sync::Arc::new(engine::Engine::new(&cfg));
+    let db_shutdown = std::sync::Arc::clone(&db);
+    let data_dir_shutdown = cfg.data_dir.clone();
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let mut sigterm = tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate()
+            ).expect("sigterm handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        }
+        #[cfg(not(unix))]
+        tokio::signal::ctrl_c().await.ok();
+
+        fw_cleanup.close();
+
+        // Persist all data before exit
+        let sql = db_shutdown.dump_sql();
+        let path = format!("{data_dir_shutdown}/runalexdb.sql");
+        if let Ok(()) = std::fs::write(&path, &sql) {
+            tracing::info!("Data persisted to {path}");
+        }
+        std::process::exit(0);
+    });
     tokio::try_join!(
         server::run(cfg.clone(), std::sync::Arc::clone(&db)),
         webui::run(cfg.clone(), std::sync::Arc::clone(&db)),
