@@ -4,8 +4,8 @@
 
 ### Security
 
-- **B-002 fixed**: WebUI API key comparison now uses `subtle::ConstantTimeEq::ct_eq()` — prevents timing side-channel — closes #20.
-- **B-003 fixed**: MySQL listener bounded to 256 concurrent sessions via `tokio::sync::Semaphore` — prevents connection-storm DoS — closes #21.
+- **B-002 fixed**: WebUI API key comparison now uses `subtle::ConstantTimeEq::ct_eq()` — prevents timing side-channel — closes #18.
+- **B-003 fixed**: MySQL listener bounded to 256 concurrent sessions via `tokio::sync::Semaphore` — prevents connection-storm DoS — closes #19.
 
 ### Fixed
 

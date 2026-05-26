@@ -324,7 +324,7 @@ There is no `Content-Length` enforcement or chunked-read loop. A client that sen
 | **Source** | [AI-INTERNAL] |
 | **File** | `src/webui.rs:67` |
 | **Discovered** | 2026-05-26 |
-| **Status** | ✅ Fixed — v0.1.2, closes #20 — subtle::ConstantTimeEq::ct_eq() replaces != |
+| **Status** | ✅ Fixed — v0.1.2, closes #18 — subtle::ConstantTimeEq::ct_eq() replaces != |
 
 **Threat model:** Local network attacker with nanosecond-resolution timing capability performing a remote timing attack against the web UI auth check.
 
@@ -349,7 +349,7 @@ Practical exploitability is very low: the key is a 64-char hex string (256-bit e
 | **Source** | [AI-INTERNAL] |
 | **File** | `src/server.rs:25-38` |
 | **Discovered** | 2026-05-26 |
-| **Status** | ✅ Fixed — v0.1.2, closes #21 — tokio::sync::Semaphore limits to 256 concurrent sessions |
+| **Status** | ✅ Fixed — v0.1.2, closes #19 — tokio::sync::Semaphore limits to 256 concurrent sessions |
 
 **Threat model:** Attacker flooding the MySQL port with unauthenticated connections to exhaust memory or file descriptors.
 
