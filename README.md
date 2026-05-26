@@ -30,6 +30,15 @@ Any MySQL or MariaDB client connects without modification — `mysql` CLI, PHP P
 
 ---
 
+
+## What's new in v0.1.1
+
+- **Firewall auto-management** — RunAlexDB opens and closes its MySQL and admin UI ports automatically (ufw/nftables/iptables). See configuration below.
+- **`dbname=` in DSN now works** — Fixed `CLIENT_CONNECT_WITH_DB` parsing in HandshakeResponse41. PHP PDO `mysql:host=...;dbname=mydb` is correctly honoured.
+- **Aggregate functions** — `COUNT(*)`, `MAX(col)`, `MIN(col)`, `SUM(col)` now return correct single-row results instead of raw rows.
+
+---
+
 ## Install
 
 ```bash
@@ -99,6 +108,24 @@ max_conn_per_sec = 100
 
 ---
 
+
+## Firewall management
+
+RunAlexDB opens and closes its own firewall rules at startup/shutdown. Supported backends: ufw, nftables, iptables (auto-detected).
+
+```toml
+# /etc/runalexdb/runalexdb.toml
+firewall_manage  = true     # default: true
+firewall_backend = "auto"   # auto | ufw | nftables | iptables
+firewall_tag     = "runalexdb"  # tag for created rules
+```
+
+Rules are created for `mysql_port` (TCP) and `webui_port` (TCP) and tagged so they can be audited with `ufw status verbose`.
+
+Set `firewall_manage = false` to manage rules manually.
+
+---
+
 ## Architecture
 
 ```
@@ -126,6 +153,7 @@ Current:
 - `CREATE TABLE`, `DROP TABLE`
 - `INSERT INTO ... VALUES`
 - `SELECT * FROM table`, `SELECT expr` (no FROM)
+- `SELECT COUNT(*), MAX(col), MIN(col), SUM(col)` aggregates
 - `SHOW DATABASES`, `SHOW TABLES`
 - `USE db`
 

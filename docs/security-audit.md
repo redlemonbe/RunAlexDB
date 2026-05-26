@@ -277,3 +277,154 @@ Per R8:
 | Cycle | Date | Source | Model | Scope |
 |-------|------|--------|-------|-------|
 | A | 2026-05-26 | [AI-INTERNAL] | Claude Sonnet 4.6 | protocol, auth, engine, webui, server |
+
+---
+
+## Cycle B — 2026-05-26 [AI-INTERNAL]
+
+**Scope:** `src/webui.rs` (full), `src/server.rs` (command loop), `src/auth.rs` (full), `src/protocol.rs` (full), `src/engine.rs` (full re-review), `src/config.rs`
+**Model:** Claude Sonnet 4.6
+**Note:** Cycle B focuses on the remaining untouched modules and a re-review of the protocol and engine post-fixes (HandshakeResponse41 fix, aggregate support, firewall module added in v0.1.1).
+
+---
+
+### RDB-2026-B-001 — WebUI HTTP server reads at most 65 536 bytes per request
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-B-001 |
+| **Severity** | LOW |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/webui.rs:27-31` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Threat model:** Attacker sending a POST /api/query with a large SQL payload.
+
+**Description:** The web UI HTTP handler issues a single `stream.read(&mut buf).await` into a fixed 65 536-byte buffer. Any HTTP request body larger than the remaining space after the headers is silently truncated. For `POST /api/query`, a long SQL statement split across two TCP segments may arrive partially — the engine receives a truncated SQL string and returns a parse error, but no indication of truncation is logged or returned.
+
+There is no `Content-Length` enforcement or chunked-read loop. A client that sends a legitimate large query will get a cryptic parse error. An attacker cannot use truncation as an exploit (truncation causes denial, not data corruption), but the silent failure is a reliability and debuggability issue.
+
+**Exploit path:** Not an exploit. Availability impact: large queries fail silently. For experimental/lab use the 65 536-byte limit is not typically hit.
+
+**Fix:** Replace the single `read()` call with a loop that reads until `\r\n\r\n` is found, then reads exactly `Content-Length` bytes for the body. Standard HTTP framing.
+
+**Residual risk after fix:** None.
+
+**Verification:** Send a POST /api/query with body > 65000 bytes; verify it is handled correctly or returns a meaningful error.
+
+---
+
+### RDB-2026-B-002 — WebUI API key compared with `!=` (timing side-channel)
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-B-002 |
+| **Severity** | LOW |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/webui.rs:67` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Threat model:** Local network attacker with nanosecond-resolution timing capability performing a remote timing attack against the web UI auth check.
+
+**Description:** `req_key != cfg.auth.webui_api_key` is a Rust `String` equality check, which short-circuits on the first differing byte. An attacker who can measure response times with sufficient precision can infer correct key bytes one at a time.
+
+Practical exploitability is very low: the key is a 64-char hex string (256-bit entropy); timing is dominated by network jitter; and the admin UI is not intended for internet exposure. However, RunNginx itself uses `subtle::ConstantTimeEq` for its API key comparison (A-001 fixed) — consistency is desirable.
+
+**Fix:** Import the `subtle` crate and use `ConstantTimeEq::ct_eq()` for the webui key comparison, same pattern as RunNginx's auth handler.
+
+**Residual risk after fix:** None.
+
+**Verification:** No practical test — code review of the comparison function suffices.
+
+---
+
+### RDB-2026-B-003 — No connection limit on MySQL listener
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-B-003 |
+| **Severity** | LOW |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/server.rs:25-38` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⏳ Open |
+
+**Threat model:** Attacker flooding the MySQL port with unauthenticated connections to exhaust memory or file descriptors.
+
+**Description:** The main accept loop calls `tokio::spawn()` for every accepted TCP connection with no concurrency bound. Each task allocates a 4 096-byte BytesMut buffer, plus Tokio task overhead (~2 KB). A client that opens 10 000 connections causes ~60 MB of allocations and exhausts the per-process file descriptor limit (default 1024 on many Linux systems).
+
+Authentication occurs after accept, so the attacker does not need valid credentials to exhaust resources.
+
+**Fix:** Add a `tokio::sync::Semaphore` before spawning — acquire a permit, release on session end. A limit of 256 concurrent sessions is reasonable for an embedded database. Alternatively, use `tokio::net::TcpListener` with a bounded `FuturesUnordered`.
+
+**Residual risk after fix:** Connections beyond the limit are rejected at the TCP layer (RST or backlog full). Behavior is deterministic.
+
+**Verification:** `for i in $(seq 1 2000); do nc 127.0.0.1 3307 & done` — observe that the process does not OOM or drop file descriptor slots.
+
+---
+
+### RDB-2026-B-004 — `mysql_native_password` uses SHA1 (protocol-level weakness)
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-B-004 |
+| **Severity** | INFO |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/auth.rs` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ⚠️ Accepted risk — inherent to MySQL protocol compatibility |
+
+**Description:** `mysql_native_password` (the only supported auth method) is SHA1-based. MySQL itself deprecated it in 8.0.34 and removed it in 9.0. SHA1 is computationally inexpensive — a compromised scramble+response pair leaks the SHA1(password) hash, which can be cracked with GPU acceleration.
+
+This is not a bug in RunAlexDB's implementation — the SHA1 scramble/XOR dance is correctly implemented per the MySQL 4.1 spec. The weakness is inherent to the protocol.
+
+**Accepted risk:** RunAlexDB v0.1.x is single-user, local-deployment, experimental. Plaintext-equivalent auth is already noted in Known Limitations (no TLS). The root password should be treated as low-value at this stage.
+
+**Future mitigation:** Implement `caching_sha2_password` (the MySQL 8.0 default) — SHA256-based, challenge-response, brute-force resistant. Required before any multi-tenant or network-exposed deployment.
+
+**Verification:** Informational.
+
+---
+
+### RDB-2026-B-005 — HandshakeResponse41 CLIENT_CONNECT_WITH_DB fix (Fixed)
+
+| Field | Value |
+|-------|-------|
+| **ID** | RDB-2026-B-005 |
+| **Severity** | N/A (bug fix) |
+| **Source** | [AI-INTERNAL] |
+| **File** | `src/server.rs:64-108` |
+| **Discovered** | 2026-05-26 |
+| **Status** | ✅ Fixed — v0.1.1, commit c4d18b6 |
+
+**Description:** Two bugs in HandshakeResponse41 parsing prevented the `dbname=` DSN parameter from being honoured. (1) `let _ = caps;` discarded the capability flags, so `CLIENT_CONNECT_WITH_DB` was never detected. (2) The `rest2` offset calculation reused the stale `user_end` variable on an already-advanced slice. Result: PHP PDO `mysql:dbname=runstore` was silently ignored — every connection arrived with no current database.
+
+**Fix applied:** Removed `let _ = caps;`. Recalculated `rest2` as `&rest[1 + auth_len..]` on the already-advanced `rest` slice. Added `db.ensure_database(db_name)` to auto-create the database on first connection.
+
+**Verification:** `php -r "new PDO('mysql:host=127.0.0.1;port=3307;dbname=runstore', 'root', '');"` — no error, and `SHOW TABLES` returns the expected schema.
+
+---
+
+## Updated Known Limitations and Accepted Risks (post Cycle B)
+
+| # | Risk | Cycle | Status |
+|---|------|-------|--------|
+| 1 | No [HUMAN-EXTERNAL] audit performed | A | Open |
+| 2 | In-memory storage — data lost on restart | A | Accepted (alpha) |
+| 3 | No TLS on MySQL or web UI ports | A | Accepted (alpha) |
+| 4 | Single-read HTTP body (65 536 byte limit) | B | Open (B-001) |
+| 5 | WebUI key compared non-constant-time | B | Open (B-002) |
+| 6 | No connection limit on MySQL listener | B | Open (B-003) |
+| 7 | mysql_native_password is SHA1-based | B | Accepted (B-004) |
+| 8 | SQL coverage minimal (no WHERE/JOIN/UPDATE/DELETE) | A | Accepted (alpha) |
+| 9 | No rate limiting on MySQL port | A | Open |
+| 10 | sqlparser crate not audited | A | Open |
+
+## Audit trail (updated)
+
+| Cycle | Date | Source | Model | Scope |
+|-------|------|--------|-------|-------|
+| A | 2026-05-26 | [AI-INTERNAL] | Claude Sonnet 4.6 | protocol, auth, engine, webui, server |
+| B | 2026-05-26 | [AI-INTERNAL] | Claude Sonnet 4.6 | webui (full), server (command loop), auth, protocol, engine re-review |
