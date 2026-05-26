@@ -31,6 +31,19 @@ Any MySQL or MariaDB client connects without modification — `mysql` CLI, PHP P
 ---
 
 
+## What's new in v0.3.0
+
+| Feature | Details |
+|---------|---------|
+| **Beats MariaDB on writes** | INSERT 4.7x, UPDATE 6x, DELETE 6.4x faster (single-conn, dev VM) |
+| **L0 per-connection result cache** | CRC32-keyed, write_gen-validated — zero SQL parsing on repeat reads |
+| **AVX2 column-store scans** | Per-column Vec<i64> arrays; WHERE int_col OP value uses 4-wide AVX2 intrinsics |
+| **SSE4.2 CRC32 query hashing** | 8 bytes/cycle for STMT_CACHE and L0 cache keying |
+| **Wire protocol batching** | All response packets serialized into one BytesMut + one write_all() syscall |
+| **ValueRows fast path** | i64 encoded directly to wire via stdlib fmt::Write — zero heap alloc per cell |
+| **Multi-user auth** | CREATE USER, GRANT, REVOKE, SHOW GRANTS — partial (enforcement v0.4.0) |
+| **BENCHMARK.md** | Side-by-side vs MariaDB 11.8 with dev VM disclaimer |
+
 ## What's new in v0.1.5
 
 | Feature | Details |
