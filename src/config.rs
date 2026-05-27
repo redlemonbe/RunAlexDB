@@ -41,6 +41,10 @@ pub struct Config {
 
     #[serde(default = "default_checkpoint_interval_secs")]
     pub checkpoint_interval_secs: u64,
+    #[serde(default)]
+    pub numa_pin: bool,
+    #[serde(default)]
+    pub worker_threads: usize,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -125,6 +129,8 @@ impl Default for Config {
             connection_timeout_secs: default_connection_timeout_secs(),
             handshake_timeout_secs: default_handshake_timeout_secs(),
             checkpoint_interval_secs: default_checkpoint_interval_secs(),
+            numa_pin: false,
+            worker_threads: 0,
         }
     }
 }

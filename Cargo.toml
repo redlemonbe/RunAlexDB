@@ -1,6 +1,6 @@
 [package]
 name        = "runalexdb"
-version = "0.3.9"
+version = "0.3.10"
 edition     = "2021"
 description = "High-performance SQL database — MySQL/MariaDB wire protocol, XDP fast-path, SIMD query engine"
 license     = "AGPL-3.0-only"
@@ -17,6 +17,7 @@ tls     = ["dep:rustls", "dep:rustls-pemfile", "dep:tokio-rustls", "dep:rcgen"]
 xdp     = []
 
 [dependencies]
+libc         = "0.2"
 # Async runtime
 tokio        = { version = "1", features = ["full"] }
 tokio-util   = { version = "0.7", features = ["codec"] }

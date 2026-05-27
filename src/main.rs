@@ -8,12 +8,35 @@ mod server;
 mod webui;
 mod firewall;
 mod icmp_guard;
+mod numa_pin;
 
 use anyhow::Result;
 use tracing::{info, warn};
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let cfg = config::Config::load().unwrap_or_default();
+    let worker_count = if cfg.worker_threads > 0 {
+        cfg.worker_threads
+    } else {
+        numa_pin::physical_core_ids().len().max(1)
+    };
+    let pin_cores = if cfg.numa_pin {
+        let cores = numa_pin::physical_core_ids();
+        if !cores.is_empty() {
+            eprintln!("NUMA pinning: {} physical cores detected", cores.len());
+        }
+        cores
+    } else { vec![] };
+    let rr = std::sync::Arc::new(numa_pin::CpuRoundRobin::new(pin_cores));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_count)
+        .on_thread_start(move || rr.pin_next())
+        .enable_all()
+        .build()?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "runalexdb=info".into())

@@ -559,12 +559,13 @@ dependencies = [
 
 [[package]]
 name = "runalexdb"
-version = "0.3.9"
+version = "0.3.10"
 dependencies = [
  "anyhow",
  "bytes",
  "dashmap",
  "hex",
+ "libc",
  "parking_lot",
  "rand",
  "rcgen",
