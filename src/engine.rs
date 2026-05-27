@@ -603,7 +603,7 @@ impl Engine {
                 }).collect();
                 QueryResult::rows(cols, rows)
             }
-            Statement::ShowColumns { show_options, .. } => {
+            Statement::ShowColumns { full, show_options, .. } => {
                 // SHOW COLUMNS FROM table_name
                 if let Some(tbl) = show_options.show_in.as_ref().and_then(|si| si.parent_name.as_ref()) {
                     let name = tbl.to_string();
@@ -616,7 +616,11 @@ impl Engine {
                     let Some(db_arc) = dbs.get(&eff_db) else { return QueryResult::err(1049, "Unknown database"); };
                     let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
                     let Some(table) = db.tables.get(&eff_table) else { return QueryResult::err(1146, "Table not found"); };
-                    let cols = vec!["Field", "Type", "Null", "Key", "Default", "Extra"];
+                    let cols: Vec<&str> = if full {
+                        vec!["Field", "Type", "Collation", "Null", "Key", "Default", "Extra", "Privileges", "Comment"]
+                    } else {
+                        vec!["Field", "Type", "Null", "Key", "Default", "Extra"]
+                    };
                     let rows: Vec<Vec<Option<String>>> = table.columns.iter().map(|c| {
                         let type_str = match &c.col_type {
                             ColumnType::Int => "int".to_owned(),
@@ -627,14 +631,30 @@ impl Engine {
                             ColumnType::Blob => "blob".to_owned(),
                             ColumnType::Timestamp => "timestamp".to_owned(),
                         };
-                        vec![
-                            Some(c.name.clone()),
-                            Some(type_str),
-                            Some(if c.nullable { "YES" } else { "NO" }.to_owned()),
-                            Some(if c.primary_key { "PRI" } else { "" }.to_owned()),
-                            None,
-                            Some(if c.primary_key { "auto_increment" } else { "" }.to_owned()),
-                        ]
+                        let is_str = matches!(&c.col_type, ColumnType::VarChar(_) | ColumnType::Text);
+                        let collation = if is_str { Some("utf8mb4_general_ci".to_owned()) } else { None };
+                        if full {
+                            vec![
+                                Some(c.name.clone()),
+                                Some(type_str),
+                                collation,
+                                Some(if c.nullable { "YES" } else { "NO" }.to_owned()),
+                                Some(if c.primary_key { "PRI" } else { "" }.to_owned()),
+                                None,
+                                Some(if c.primary_key { "auto_increment" } else { "" }.to_owned()),
+                                Some("select,insert,update,references".to_owned()),
+                                Some(String::new()),
+                            ]
+                        } else {
+                            vec![
+                                Some(c.name.clone()),
+                                Some(type_str),
+                                Some(if c.nullable { "YES" } else { "NO" }.to_owned()),
+                                Some(if c.primary_key { "PRI" } else { "" }.to_owned()),
+                                None,
+                                Some(if c.primary_key { "auto_increment" } else { "" }.to_owned()),
+                            ]
+                        }
                     }).collect();
                     return QueryResult::rows(cols, rows);
                 }
@@ -1400,10 +1420,19 @@ impl Engine {
         };
 
         // Aggregate-only projection
-        let is_aggregate_only = !sel.projection.is_empty() && sel.projection.iter().all(|p| {
-            matches!(p,
-                SelectItem::UnnamedExpr(Expr::Function(_))
-                | SelectItem::ExprWithAlias { expr: Expr::Function(_), .. })
+        let is_agg_fname = |name: &str| matches!(name,
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "GROUP_CONCAT"
+            | "STD" | "STDDEV" | "STDDEV_POP" | "VARIANCE" | "VAR_POP"
+            | "BIT_AND" | "BIT_OR" | "BIT_XOR"
+        );
+        let has_group_by = matches!(&sel.group_by, sqlparser::ast::GroupByExpr::Expressions(exprs, _) if !exprs.is_empty());
+        let is_aggregate_only = !sel.projection.is_empty() && !has_group_by && sel.projection.iter().all(|p| {
+            let f = match p {
+                SelectItem::UnnamedExpr(Expr::Function(f)) => f,
+                SelectItem::ExprWithAlias { expr: Expr::Function(f), .. } => f,
+                _ => return false,
+            };
+            is_agg_fname(f.name.to_string().to_uppercase().as_str())
         });
 
         if is_aggregate_only {
@@ -1426,7 +1455,63 @@ impl Engine {
                 };
                 let fname = func.name.to_string().to_uppercase();
                 match fname.as_str() {
-                    "COUNT" => Some(filtered.len().to_string()), // O(1) since filtered is already built
+                    "COUNT" => {
+                        if let sqlparser::ast::FunctionArguments::List(ref list) = func.args {
+                            if matches!(list.duplicate_treatment, Some(sqlparser::ast::DuplicateTreatment::Distinct)) {
+                                let col_name = list.args.iter().next().and_then(|a| match a {
+                                    sqlparser::ast::FunctionArg::Unnamed(fae) => match fae {
+                                        sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)) => Some(id.value.clone()),
+                                        sqlparser::ast::FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts)) => parts.last().map(|i| i.value.clone()),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                }).unwrap_or_default();
+                                let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
+                                let count = col_idx.map(|idx| {
+                                    let mut seen = std::collections::HashSet::new();
+                                    filtered.iter()
+                                        .filter_map(|r| r.get(idx))
+                                        .filter(|v| !matches!(v, Value::Null))
+                                        .filter_map(|v| v.to_display())
+                                        .filter(|k| seen.insert(k.clone()))
+                                        .count()
+                                }).unwrap_or(0);
+                                return Some(count.to_string());
+                            }
+                        }
+                        Some(filtered.len().to_string())
+                    }
+                    "GROUP_CONCAT" => {
+                        let (sep, col_name_opt) = if let sqlparser::ast::FunctionArguments::List(ref list) = func.args {
+                            let sep = list.clauses.iter().find_map(|cl| {
+                                if let sqlparser::ast::FunctionArgumentClause::Separator(ref sv) = cl {
+                                    match sv {
+                                        sqlparser::ast::Value::SingleQuotedString(s)
+                                        | sqlparser::ast::Value::DoubleQuotedString(s) => Some(s.clone()),
+                                        _ => None,
+                                    }
+                                } else { None }
+                            }).unwrap_or_else(|| ",".to_owned());
+                            let col = list.args.iter().next().and_then(|a| match a {
+                                sqlparser::ast::FunctionArg::Unnamed(fae) => match fae {
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)) => Some(id.value.clone()),
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts)) => parts.last().map(|i| i.value.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            });
+                            (sep, col)
+                        } else { (",".to_owned(), None) };
+                        let col_name = col_name_opt.unwrap_or_default();
+                        let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
+                        col_idx.map(|idx| {
+                            let parts: Vec<String> = filtered.iter()
+                                .filter_map(|r| r.get(idx))
+                                .filter_map(|v| v.to_display())
+                                .collect();
+                            parts.join(&sep)
+                        }).filter(|s| !s.is_empty())
+                    }
                     "MAX" => {
                         let col_name = func.args.to_string().trim().trim_start_matches("(").trim_end_matches(")").trim().to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
@@ -1506,7 +1591,61 @@ impl Engine {
                 let fname = f.name.to_string().to_uppercase();
                 let col_arg = f.args.to_string().trim().trim_start_matches('(').trim_end_matches(')').trim().to_owned();
                 match fname.as_str() {
-                    "COUNT" => Some(rows.len().to_string()),
+                    "COUNT" => {
+                        if let sqlparser::ast::FunctionArguments::List(ref list) = f.args {
+                            if matches!(list.duplicate_treatment, Some(sqlparser::ast::DuplicateTreatment::Distinct)) {
+                                let col_arg_clean = list.args.iter().next().and_then(|a| match a {
+                                    sqlparser::ast::FunctionArg::Unnamed(fae) => match fae {
+                                        sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)) => Some(id.value.clone()),
+                                        sqlparser::ast::FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts)) => parts.last().map(|i| i.value.clone()),
+                                        _ => None,
+                                    },
+                                    _ => None,
+                                }).unwrap_or_default();
+                                if col_arg_clean != "*" && !col_arg_clean.is_empty() {
+                                    let ci = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg_clean));
+                                    return ci.map(|ci| {
+                                        let mut seen = std::collections::HashSet::new();
+                                        rows.iter()
+                                            .filter_map(|r| r.get(ci))
+                                            .filter(|v| !matches!(v, Value::Null))
+                                            .filter_map(|v| v.to_display())
+                                            .filter(|k| seen.insert(k.clone()))
+                                            .count().to_string()
+                                    }).or_else(|| Some("0".to_owned()));
+                                }
+                            }
+                        }
+                        Some(rows.len().to_string())
+                    }
+                    "GROUP_CONCAT" => {
+                        let (sep, col_name_opt) = if let sqlparser::ast::FunctionArguments::List(ref list) = f.args {
+                            let sep = list.clauses.iter().find_map(|cl| {
+                                if let sqlparser::ast::FunctionArgumentClause::Separator(ref sv) = cl {
+                                    match sv {
+                                        sqlparser::ast::Value::SingleQuotedString(s)
+                                        | sqlparser::ast::Value::DoubleQuotedString(s) => Some(s.clone()),
+                                        _ => None,
+                                    }
+                                } else { None }
+                            }).unwrap_or_else(|| ",".to_owned());
+                            let col = list.args.iter().next().and_then(|a| match a {
+                                sqlparser::ast::FunctionArg::Unnamed(fae) => match fae {
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id)) => Some(id.value.clone()),
+                                    sqlparser::ast::FunctionArgExpr::Expr(Expr::CompoundIdentifier(parts)) => parts.last().map(|i| i.value.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            });
+                            (sep, col)
+                        } else { (",".to_owned(), None) };
+                        let ci = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(col_name_opt.as_deref().unwrap_or("")))?;
+                        let parts: Vec<String> = rows.iter()
+                            .filter_map(|r| r.get(ci))
+                            .filter_map(|v| v.to_display())
+                            .collect();
+                        if parts.is_empty() { None } else { Some(parts.join(&sep)) }
+                    }
                     "SUM" => {
                         let ci = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg));
                         ci.map(|ci| rows.iter().filter_map(|r| r.get(ci))
@@ -2326,6 +2465,29 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                 "ISNULL" => {
                     let v = args.into_iter().next().unwrap_or(Value::Null);
                     Value::Int(if matches!(v, Value::Null) { 1 } else { 0 })
+                }
+                "GREATEST" => {
+                    let vals: Vec<Value> = args.into_iter().filter(|v| !matches!(v, Value::Null)).collect();
+                    vals.into_iter().max_by(|a, b| values_cmp(a, b)).unwrap_or(Value::Null)
+                }
+                "LEAST" => {
+                    let vals: Vec<Value> = args.into_iter().filter(|v| !matches!(v, Value::Null)).collect();
+                    vals.into_iter().min_by(|a, b| values_cmp(a, b)).unwrap_or(Value::Null)
+                }
+                "FIELD" => {
+                    let mut it = args.into_iter();
+                    let target = it.next().unwrap_or(Value::Null);
+                    it.enumerate().find_map(|(i, v)| if values_eq(&target, &v) { Some(Value::Int((i + 1) as i64)) } else { None })
+                        .unwrap_or(Value::Int(0))
+                }
+                "FIND_IN_SET" => {
+                    let mut it = args.into_iter();
+                    let needle = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let haystack = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let pos = haystack.split(',').enumerate()
+                        .find_map(|(i, s)| if s == needle { Some(i + 1) } else { None })
+                        .unwrap_or(0);
+                    Value::Int(pos as i64)
                 }
                 _ => Value::Null,
             }
