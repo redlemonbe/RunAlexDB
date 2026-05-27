@@ -847,6 +847,198 @@ impl Engine {
         QueryResult::ok(count, 0)
     }
 
+    fn select_joined(
+        &self,
+        db_name: String,
+        sel: Box<sqlparser::ast::Select>,
+        order_by: Option<sqlparser::ast::OrderBy>,
+        limit: Option<Expr>,
+        offset: Option<sqlparser::ast::Offset>,
+    ) -> QueryResult {
+        use sqlparser::ast::{JoinOperator, JoinConstraint, SelectItem};
+
+        // Extract actual table name without alias (e.g. "users AS u" → "users").
+        let raw_base = match &sel.from[0].relation {
+            sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+            other => other.to_string(),
+        };
+        let (base_db, base_tbl) = if let Some(dot) = raw_base.find('.') {
+            (raw_base[..dot].trim_matches('`').to_owned(), raw_base[dot+1..].trim_matches('`').to_owned())
+        } else {
+            (db_name.clone(), raw_base.trim_matches('`').to_owned())
+        };
+
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+
+        let (left_cols, left_rows): (Vec<Column>, Vec<Row>) = {
+            let Some(db_arc) = dbs.get(&base_db) else {
+                return QueryResult::err(1049, &format!("Unknown database '{}'", base_db));
+            };
+            let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+            let Some(tbl) = db.tables.get(&base_tbl) else {
+                return QueryResult::err(1146, &format!("Table '{}' doesn't exist", base_tbl));
+            };
+            (tbl.columns.clone(), tbl.rows.clone())
+        };
+
+        let mut combined_cols: Vec<Column> = left_cols;
+        let mut combined_rows: Vec<Row> = left_rows;
+
+        for join in &sel.from[0].joins {
+            let right_raw = match &join.relation {
+                sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+                other => other.to_string(),
+            };
+            let (right_db_name, right_tbl_name) = if let Some(dot) = right_raw.find('.') {
+                (right_raw[..dot].trim_matches('`').to_owned(), right_raw[dot+1..].trim_matches('`').to_owned())
+            } else {
+                (db_name.clone(), right_raw.trim_matches('`').to_owned())
+            };
+
+            let (right_cols, right_rows): (Vec<Column>, Vec<Row>) = {
+                let Some(rdb_arc) = dbs.get(&right_db_name) else {
+                    return QueryResult::err(1049, &format!("Unknown database '{}'", right_db_name));
+                };
+                let rdb = rdb_arc.read().unwrap_or_else(|e| e.into_inner());
+                let Some(rtbl) = rdb.tables.get(&right_tbl_name) else {
+                    return QueryResult::err(1146, &format!("Table '{}' doesn't exist", right_tbl_name));
+                };
+                (rtbl.columns.clone(), rtbl.rows.clone())
+            };
+
+            let existing: std::collections::HashSet<String> =
+                combined_cols.iter().map(|c| c.name.to_lowercase()).collect();
+            let right_ncols = right_cols.len();
+            for c in &right_cols {
+                let name = if existing.contains(&c.name.to_lowercase()) {
+                    format!("{}.{}", right_tbl_name, c.name)
+                } else {
+                    c.name.clone()
+                };
+                combined_cols.push(Column { name, ..c.clone() });
+            }
+
+            let (on_expr, is_left) = match &join.join_operator {
+                JoinOperator::Join(JoinConstraint::On(e))
+                | JoinOperator::Inner(JoinConstraint::On(e))  => (Some(e.clone()), false),
+                JoinOperator::Left(JoinConstraint::On(e))
+                | JoinOperator::LeftOuter(JoinConstraint::On(e)) => (Some(e.clone()), true),
+                JoinOperator::CrossJoin => (None, false),
+                _ => (None, false),
+            };
+
+            let mut new_rows: Vec<Row> = Vec::new();
+            for left_row in &combined_rows {
+                let mut matched = false;
+                for right_row in &right_rows {
+                    let mut combined: Row = left_row.clone();
+                    combined.extend_from_slice(right_row);
+                    let ok = on_expr.as_ref()
+                        .map_or(true, |e| eval_where(&combined, &combined_cols, e));
+                    if ok {
+                        matched = true;
+                        new_rows.push(combined);
+                    }
+                }
+                if !matched && is_left {
+                    let mut combined = left_row.clone();
+                    combined.extend(std::iter::repeat(Value::Null).take(right_ncols));
+                    new_rows.push(combined);
+                }
+            }
+            combined_rows = new_rows;
+        }
+
+        drop(dbs);
+
+        let filtered: Vec<Row> = combined_rows
+            .into_iter()
+            .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &combined_cols, w)))
+            .collect();
+
+        let is_wildcard = sel.projection.iter().any(|p| {
+            matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))
+        });
+        let (out_names, out_exprs): (Vec<String>, Vec<Expr>) = if is_wildcard {
+            (
+                combined_cols.iter().map(|c| {
+                    c.name.rsplitn(2, '.').next().unwrap_or(&c.name).to_owned()
+                }).collect(),
+                combined_cols.iter().map(|c| {
+                    Expr::Identifier(sqlparser::ast::Ident::new(c.name.clone()))
+                }).collect(),
+            )
+        } else {
+            sel.projection.iter().map(|p| match p {
+                SelectItem::UnnamedExpr(e) => {
+                    let name = match e {
+                        Expr::Identifier(id) => id.value.clone(),
+                        Expr::CompoundIdentifier(parts) =>
+                            parts.last().map(|i| i.value.clone()).unwrap_or_default(),
+                        _ => e.to_string(),
+                    };
+                    (name, e.clone())
+                }
+                SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr.clone()),
+                _ => ("?".to_owned(), Expr::Identifier(sqlparser::ast::Ident::new("__null__"))),
+            }).unzip()
+        };
+
+        let mut result_rows: Vec<Vec<Option<String>>> = filtered
+            .iter()
+            .map(|row| {
+                out_exprs.iter()
+                    .map(|e| eval_row_expr(row, &combined_cols, e).to_display())
+                    .collect()
+            })
+            .collect();
+
+        if let Some(ob) = &order_by {
+            if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+                for order_expr in exprs.iter().rev() {
+                    let col_name = order_expr.expr.to_string();
+                    if let Some(pidx) = out_names.iter().position(|n| n.eq_ignore_ascii_case(&col_name)) {
+                        let asc = order_expr.options.asc.unwrap_or(true);
+                        result_rows.sort_by(|a, b| {
+                            let av = a.get(pidx).and_then(|x| x.as_deref());
+                            let bv = b.get(pidx).and_then(|x| x.as_deref());
+                            let ord = match (av, bv) {
+                                (Some(x), Some(y)) => match (x.parse::<i64>(), y.parse::<i64>()) {
+                                    (Ok(xi), Ok(yi)) => xi.cmp(&yi),
+                                    _ => x.cmp(y),
+                                },
+                                (None, Some(_)) => std::cmp::Ordering::Less,
+                                (Some(_), None) => std::cmp::Ordering::Greater,
+                                (None, None) => std::cmp::Ordering::Equal,
+                            };
+                            if asc { ord } else { ord.reverse() }
+                        });
+                    }
+                }
+            }
+        }
+
+        let offset_n = offset.as_ref().and_then(|o| {
+            if let Expr::Value(vs) = &o.value {
+                if let sqlparser::ast::Value::Number(n, _) = &vs.value { n.parse::<usize>().ok() }
+                else { None }
+            } else { None }
+        }).unwrap_or(0);
+        if offset_n > 0 {
+            result_rows = result_rows.into_iter().skip(offset_n).collect();
+        }
+
+        if let Some(lim) = &limit {
+            if let Expr::Value(vs) = lim {
+                if let sqlparser::ast::Value::Number(n, _) = &vs.value {
+                    if let Ok(n) = n.parse::<usize>() { result_rows.truncate(n); }
+                }
+            }
+        }
+
+        QueryResult::rows(out_names, result_rows)
+    }
+
     fn select(&self, db_name: &str, query: Query) -> QueryResult {
         let SetExpr::Select(sel) = *query.body else {
             return QueryResult::err(1295, "Complex SELECT not yet supported");
@@ -873,6 +1065,9 @@ impl Engine {
             (db_name.to_owned(), raw_table.trim_matches('`').to_owned())
         };
         let db_name = sel_db;
+        if !sel.from[0].joins.is_empty() {
+            return self.select_joined(db_name, sel, query.order_by, query.limit, query.offset);
+        }
         let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
         let Some(db_arc) = dbs.get(&db_name) else {
             return QueryResult::err(1049, &format!("Unknown database '{db_name}'"));
@@ -1505,7 +1700,9 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
         }
         Expr::CompoundIdentifier(parts) => {
             if let Some(last) = parts.last() {
-                cols.iter().position(|c| c.name.eq_ignore_ascii_case(&last.value))
+                let qualified: String = parts.iter().map(|p| p.value.as_str()).collect::<Vec<_>>().join(".");
+                cols.iter().position(|c| c.name.eq_ignore_ascii_case(&qualified))
+                    .or_else(|| cols.iter().position(|c| c.name.eq_ignore_ascii_case(&last.value)))
                     .and_then(|idx| row.get(idx).cloned())
                     .unwrap_or(Value::Null)
             } else { Value::Null }
