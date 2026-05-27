@@ -164,6 +164,8 @@ pub struct Engine {
     /// Global write generation counter. Incremented on every INSERT/UPDATE/DELETE.
     /// Per-connection L0 cache checks this to detect cross-connection invalidation.
     pub write_gen: std::sync::atomic::AtomicU64,
+    /// Last auto-generated or inserted PK value (per MySQL semantics).
+    pub last_insert_id: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -189,6 +191,7 @@ impl Engine {
             databases: RwLock::new(dbs),
             users: RwLock::new(users),
             write_gen: std::sync::atomic::AtomicU64::new(0),
+            last_insert_id: std::sync::atomic::AtomicU64::new(0),
         };
 
         // Auto-load persisted data on startup
@@ -270,6 +273,12 @@ impl Engine {
         // MySQL system variables — SELECT @@var or SELECT @@session.var
         if sql_upper.starts_with("SELECT @@") {
             return self.exec_select_sysvar(sql.trim());
+        }
+
+        // LAST_INSERT_ID()
+        if sql_upper.starts_with("SELECT LAST_INSERT_ID()") {
+            let id = self.last_insert_id.load(std::sync::atomic::Ordering::Relaxed);
+            return QueryResult::rows(vec!["LAST_INSERT_ID()"], vec![vec![Some(id.to_string())]]);
         }
 
         // SET statements (ignored — just return OK)
@@ -879,7 +888,16 @@ impl Engine {
             }
             table.rows.push(row);
         }
-        QueryResult::ok(count, 0)
+        let pk_val = table.pk_col_idx.and_then(|pk_idx| {
+            table.rows.last().and_then(|r| r.get(pk_idx)).and_then(|v| {
+                if let Value::Int(n) = v { Some(*n as u64) } else { None }
+            })
+        }).unwrap_or(0);
+        drop(table);
+        drop(db);
+        drop(dbs);
+        self.last_insert_id.store(pk_val, std::sync::atomic::Ordering::Relaxed);
+        QueryResult::ok(count, pk_val)
     }
 
     fn select_joined(
@@ -1241,7 +1259,7 @@ impl Engine {
             }).collect();
             let eval_group_agg = |f: &sqlparser::ast::Function, rows: &Vec<&Row>| -> Option<String> {
                 let fname = f.name.to_string().to_uppercase();
-                let col_arg = f.args.to_string().trim().to_owned();
+                let col_arg = f.args.to_string().trim().trim_start_matches('(').trim_end_matches(')').trim().to_owned();
                 match fname.as_str() {
                     "COUNT" => Some(rows.len().to_string()),
                     "SUM" => {
@@ -1303,7 +1321,7 @@ impl Engine {
                     // Evaluate HAVING against the aggregate result — build a synthetic row
                     // HAVING COUNT(*) > N: compare out_rows aggregate values
                     // Simple implementation: only support HAVING COUNT(*) > N / = N
-                    let ok = eval_having_agg(having, rows.len());
+                    let ok = eval_having_agg(having, &rows, &table.columns);
                     if !ok { return None; }
                 }
                 Some(row_vals)
@@ -2146,39 +2164,78 @@ fn like_match(value: &str, pattern: &str) -> bool {
 }
 
 
-fn eval_having_agg(expr: &Expr, group_count: usize) -> bool {
+fn eval_having_agg_val(expr: &Expr, rows: &[&Row], cols: &[Column]) -> Value {
     match expr {
-        Expr::BinaryOp { left, op, right } => {
-            // Evaluate left side as COUNT(*) or a literal
-            let lv = match left.as_ref() {
-                Expr::Function(f) if f.name.to_string().to_uppercase() == "COUNT" => {
-                    Value::Int(group_count as i64)
+        Expr::Function(f) => {
+            let fname = f.name.to_string().to_uppercase();
+            let col_arg = f.args.to_string().trim().trim_start_matches('(').trim_end_matches(')').trim().to_owned();
+            match fname.as_str() {
+                "COUNT" => Value::Int(rows.len() as i64),
+                "SUM" => {
+                    if let Some(ci) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg)) {
+                        Value::Int(rows.iter().filter_map(|r| r.get(ci))
+                            .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                            .sum::<i64>())
+                    } else { Value::Null }
                 }
-                Expr::Value(vs) => match &vs.value {
-                    sqlparser::ast::Value::Number(n, _) => n.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
-                    _ => Value::Null,
-                },
+                "AVG" => {
+                    if let Some(ci) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg)) {
+                        let nums: Vec<i64> = rows.iter().filter_map(|r| r.get(ci))
+                            .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                            .collect();
+                        if nums.is_empty() { Value::Null }
+                        else { Value::Int(nums.iter().sum::<i64>() / nums.len() as i64) }
+                    } else { Value::Null }
+                }
+                "MAX" => {
+                    if let Some(ci) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg)) {
+                        rows.iter().filter_map(|r| r.get(ci))
+                            .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                            .max().map(Value::Int).unwrap_or(Value::Null)
+                    } else { Value::Null }
+                }
+                "MIN" => {
+                    if let Some(ci) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&col_arg)) {
+                        rows.iter().filter_map(|r| r.get(ci))
+                            .filter_map(|v| if let Value::Int(n) = v { Some(*n) } else { None })
+                            .min().map(Value::Int).unwrap_or(Value::Null)
+                    } else { Value::Null }
+                }
                 _ => Value::Null,
-            };
-            let rv = match right.as_ref() {
-                Expr::Value(vs) => match &vs.value {
-                    sqlparser::ast::Value::Number(n, _) => n.parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
-                    _ => Value::Null,
-                },
-                _ => Value::Null,
-            };
-            match op {
-                BinaryOperator::Eq    => values_eq(&lv, &rv),
-                BinaryOperator::NotEq => !values_eq(&lv, &rv),
-                BinaryOperator::Gt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Greater,
-                BinaryOperator::GtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Less,
-                BinaryOperator::Lt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Less,
-                BinaryOperator::LtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Greater,
-                BinaryOperator::And   => eval_having_agg(left, group_count) && eval_having_agg(right, group_count),
-                BinaryOperator::Or    => eval_having_agg(left, group_count) || eval_having_agg(right, group_count),
-                _ => true,
             }
         }
+        Expr::Value(vs) => expr_to_value(Expr::Value(vs.clone())),
+        Expr::Identifier(id) => {
+            if let Some(ci) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&id.value)) {
+                rows.first().and_then(|r| r.get(ci)).cloned().unwrap_or(Value::Null)
+            } else { Value::Null }
+        }
+        _ => Value::Null,
+    }
+}
+
+fn eval_having_agg(expr: &Expr, rows: &[&Row], cols: &[Column]) -> bool {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                BinaryOperator::And => eval_having_agg(left, rows, cols) && eval_having_agg(right, rows, cols),
+                BinaryOperator::Or  => eval_having_agg(left, rows, cols) || eval_having_agg(right, rows, cols),
+                op => {
+                    let lv = eval_having_agg_val(left, rows, cols);
+                    let rv = eval_having_agg_val(right, rows, cols);
+                    match op {
+                        BinaryOperator::Eq    => values_eq(&lv, &rv),
+                        BinaryOperator::NotEq => !values_eq(&lv, &rv),
+                        BinaryOperator::Gt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Greater,
+                        BinaryOperator::GtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Less,
+                        BinaryOperator::Lt    => values_cmp(&lv, &rv) == std::cmp::Ordering::Less,
+                        BinaryOperator::LtEq  => values_cmp(&lv, &rv) != std::cmp::Ordering::Greater,
+                        _ => true,
+                    }
+                }
+            }
+        }
+        Expr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Not) => !eval_having_agg(expr, rows, cols),
         _ => true,
     }
 }
