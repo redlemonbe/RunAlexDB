@@ -321,22 +321,65 @@ impl Engine {
 
         // INFORMATION_SCHEMA.TABLES
         if sql_upper.contains("INFORMATION_SCHEMA.TABLES") || sql_upper.contains("INFORMATION_SCHEMA.`TABLES`") {
+            // Extract optional TABLE_SCHEMA filter from WHERE clause
+            let schema_filter: Option<String> = {
+                let re_schema = sql_upper.find("TABLE_SCHEMA").and_then(|pos| {
+                    let after = sql_upper[pos + "TABLE_SCHEMA".len()..].trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+                    let raw = after.trim_start_matches('\'').trim_start_matches('"');
+                    let end = raw.find(|c: char| c == '\'' || c == '"' || c == ' ').unwrap_or(raw.len());
+                    let val = &raw[..end];
+                    if val.is_empty() { None } else { Some(val.to_lowercase()) }
+                });
+                re_schema
+            };
+            let table_name_filter: Option<String> = {
+                {
+                let mut _p = 0usize;
+                let mut _found: Option<String> = None;
+                while let Some(off) = sql_upper[_p..].find("TABLE_NAME") {
+                    let abs = _p + off;
+                    let rest = sql_upper[abs + "TABLE_NAME".len()..].trim_start_matches(|c: char| c.is_whitespace());
+                    if rest.starts_with('=') {
+                        let after = rest[1..].trim_start_matches(|c: char| c.is_whitespace());
+                        let raw = after.trim_start_matches('\'').trim_start_matches('"');
+                        let end = raw.find(|c: char| c == '\'' || c == '"').unwrap_or(raw.len());
+                        let val = &raw[..end];
+                        if !val.is_empty() { _found = Some(val.to_lowercase()); }
+                        break;
+                    }
+                    _p = abs + "TABLE_NAME".len();
+                }
+                _found
+            }
+            };
             let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
-            let cols = vec!["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE", "TABLE_ROWS"];
+            let cols = vec!["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE", "ENGINE",
+                            "VERSION", "ROW_FORMAT", "TABLE_ROWS", "AVG_ROW_LENGTH", "DATA_LENGTH",
+                            "MAX_DATA_LENGTH", "INDEX_LENGTH", "DATA_FREE", "AUTO_INCREMENT",
+                            "CREATE_TIME", "UPDATE_TIME", "CHECK_TIME", "TABLE_COLLATION", "CHECKSUM",
+                            "CREATE_OPTIONS", "TABLE_COMMENT"];
             let mut rows: Vec<Vec<Option<String>>> = Vec::new();
             for (db_name, db_arc) in dbs.iter() {
                 if db_name.starts_with("information_schema") || db_name.starts_with("performance_schema") {
                     continue;
                 }
+                if let Some(ref sf) = schema_filter {
+                    if !db_name.eq_ignore_ascii_case(sf) { continue; }
+                }
                 let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
                 for (tname, table) in &db.tables {
+                    if let Some(ref tf) = table_name_filter {
+                        if !tname.eq_ignore_ascii_case(tf) { continue; }
+                    }
                     rows.push(vec![
-                        Some("def".into()),
-                        Some(db_name.clone()),
-                        Some(tname.clone()),
-                        Some("BASE TABLE".into()),
-                        Some("RunAlexDB".into()),
-                        Some(table.rows.len().to_string()),
+                        Some("def".into()), Some(db_name.clone()), Some(tname.clone()),
+                        Some("BASE TABLE".into()), Some("RunAlexDB".into()),
+                        Some("10".into()), Some("Dynamic".into()),
+                        Some(table.rows.len().to_string()), Some("0".into()), Some("0".into()),
+                        Some("0".into()), Some("0".into()), Some("0".into()),
+                        table.pk_col_idx.map(|_| table.next_auto.to_string()),
+                        None, None, None, Some("utf8mb4_general_ci".into()), None,
+                        Some("".into()), Some("".into()),
                     ]);
                 }
             }
@@ -345,34 +388,122 @@ impl Engine {
 
         // INFORMATION_SCHEMA.COLUMNS
         if sql_upper.contains("INFORMATION_SCHEMA.COLUMNS") || sql_upper.contains("INFORMATION_SCHEMA.`COLUMNS`") {
+            let schema_filter2: Option<String> = sql_upper.find("TABLE_SCHEMA").and_then(|pos| {
+                let after = sql_upper[pos + "TABLE_SCHEMA".len()..].trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+                let raw = after.trim_start_matches('\'').trim_start_matches('"');
+                let end = raw.find(|c: char| c == '\'' || c == '"' || c == ' ').unwrap_or(raw.len());
+                let val = &raw[..end];
+                if val.is_empty() { None } else { Some(val.to_lowercase()) }
+            });
+            let table_filter2: Option<String> = sql_upper.find("TABLE_NAME").and_then(|pos| {
+                let after = sql_upper[pos + "TABLE_NAME".len()..].trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+                let raw = after.trim_start_matches('\'').trim_start_matches('"');
+                let end = raw.find(|c: char| c == '\'' || c == '"' || c == ' ').unwrap_or(raw.len());
+                let val = &raw[..end];
+                if val.is_empty() { None } else { Some(val.to_lowercase()) }
+            });
             let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
-            let cols = vec!["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "COLUMN_TYPE", "IS_NULLABLE", "COLUMN_KEY"];
+            let cols = vec!["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME",
+                            "ORDINAL_POSITION", "COLUMN_DEFAULT", "IS_NULLABLE", "DATA_TYPE",
+                            "CHARACTER_MAXIMUM_LENGTH", "NUMERIC_PRECISION", "COLUMN_TYPE",
+                            "COLUMN_KEY", "EXTRA", "PRIVILEGES", "COLUMN_COMMENT"];
             let mut rows: Vec<Vec<Option<String>>> = Vec::new();
             for (db_name, db_arc) in dbs.iter() {
-                if db_name.starts_with("information_schema") || db_name.starts_with("performance_schema") {
-                    continue;
-                }
+                if db_name.starts_with("information_schema") || db_name.starts_with("performance_schema") { continue; }
+                if let Some(ref sf) = schema_filter2 { if !db_name.eq_ignore_ascii_case(sf) { continue; } }
                 let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
                 for (tname, table) in &db.tables {
+                    if let Some(ref tf) = table_filter2 { if !tname.eq_ignore_ascii_case(tf) { continue; } }
                     for (pos, col) in table.columns.iter().enumerate() {
-                        let col_type_str = match &col.col_type {
-                            crate::engine::ColumnType::Int => "int".to_string(),
-                            crate::engine::ColumnType::BigInt => "bigint".to_string(),
-                            crate::engine::ColumnType::Float => "double".to_string(),
-                            crate::engine::ColumnType::VarChar(n) => format!("varchar({})", n),
-                            crate::engine::ColumnType::Text => "text".to_string(),
-                            crate::engine::ColumnType::Blob => "blob".to_string(),
-                            crate::engine::ColumnType::Timestamp => "timestamp".to_string(),
+                        let (data_type, col_type_str, char_max, num_prec) = match &col.col_type {
+                            ColumnType::Int => ("int", "int".to_owned(), None, Some("10".to_owned())),
+                            ColumnType::BigInt => ("bigint", "bigint".to_owned(), None, Some("20".to_owned())),
+                            ColumnType::Float => ("double", "double".to_owned(), None, Some("22".to_owned())),
+                            ColumnType::VarChar(n) => ("varchar", format!("varchar({})", n), Some(n.to_string()), None),
+                            ColumnType::Text => ("text", "text".to_owned(), Some("65535".to_owned()), None),
+                            ColumnType::Blob => ("blob", "blob".to_owned(), Some("65535".to_owned()), None),
+                            ColumnType::Timestamp => ("timestamp", "timestamp".to_owned(), None, None),
                         };
                         rows.push(vec![
-                            Some("def".into()),
-                            Some(db_name.clone()),
-                            Some(tname.clone()),
-                            Some(col.name.clone()),
-                            Some((pos + 1).to_string()),
-                            Some(col_type_str),
+                            Some("def".into()), Some(db_name.clone()), Some(tname.clone()),
+                            Some(col.name.clone()), Some((pos+1).to_string()),
+                            None, // COLUMN_DEFAULT
                             Some(if col.nullable { "YES" } else { "NO" }.into()),
+                            Some(data_type.to_owned()),
+                            char_max, num_prec,
+                            Some(col_type_str),
                             Some(if col.primary_key { "PRI" } else { "" }.into()),
+                            Some(if col.primary_key { "auto_increment" } else { "" }.into()),
+                            Some("select,insert,update,references".into()),
+                            Some("".into()),
+                        ]);
+                    }
+                }
+            }
+            return QueryResult::rows(cols, rows);
+        }
+
+        // INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        if sql_upper.contains("INFORMATION_SCHEMA.KEY_COLUMN_USAGE") {
+            let schema_filter3: Option<String> = sql_upper.find("TABLE_SCHEMA").and_then(|pos| {
+                let after = sql_upper[pos + "TABLE_SCHEMA".len()..].trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+                let raw = after.trim_start_matches('\'').trim_start_matches('"');
+                let end = raw.find(|c: char| c == '\'' || c == '"' || c == ' ').unwrap_or(raw.len());
+                let val = &raw[..end];
+                if val.is_empty() { None } else { Some(val.to_lowercase()) }
+            });
+            let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+            let cols = vec!["CONSTRAINT_CATALOG", "CONSTRAINT_SCHEMA", "CONSTRAINT_NAME",
+                            "TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME",
+                            "COLUMN_NAME", "ORDINAL_POSITION",
+                            "POSITION_IN_UNIQUE_CONSTRAINT",
+                            "REFERENCED_TABLE_SCHEMA", "REFERENCED_TABLE_NAME", "REFERENCED_COLUMN_NAME"];
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+            for (db_name, db_arc) in dbs.iter() {
+                if db_name.starts_with("information_schema") || db_name.starts_with("performance_schema") { continue; }
+                if let Some(ref sf) = schema_filter3 { if !db_name.eq_ignore_ascii_case(sf) { continue; } }
+                let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                for (tname, table) in &db.tables {
+                    if let Some(pk_idx) = table.pk_col_idx {
+                        rows.push(vec![
+                            Some("def".into()), Some(db_name.clone()), Some("PRIMARY".into()),
+                            Some("def".into()), Some(db_name.clone()), Some(tname.clone()),
+                            Some(table.columns[pk_idx].name.clone()), Some("1".into()),
+                            None, None, None, None,
+                        ]);
+                    }
+                }
+            }
+            return QueryResult::rows(cols, rows);
+        }
+
+        // INFORMATION_SCHEMA.STATISTICS
+        if sql_upper.contains("INFORMATION_SCHEMA.STATISTICS") {
+            let schema_filter4: Option<String> = sql_upper.find("TABLE_SCHEMA").and_then(|pos| {
+                let after = sql_upper[pos + "TABLE_SCHEMA".len()..].trim_start_matches(|c: char| c.is_whitespace() || c == '=');
+                let raw = after.trim_start_matches('\'').trim_start_matches('"');
+                let end = raw.find(|c: char| c == '\'' || c == '"' || c == ' ').unwrap_or(raw.len());
+                let val = &raw[..end];
+                if val.is_empty() { None } else { Some(val.to_lowercase()) }
+            });
+            let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+            let cols = vec!["TABLE_CATALOG", "TABLE_SCHEMA", "TABLE_NAME", "NON_UNIQUE",
+                            "INDEX_SCHEMA", "INDEX_NAME", "SEQ_IN_INDEX", "COLUMN_NAME",
+                            "COLLATION", "CARDINALITY", "SUB_PART", "PACKED", "NULLABLE",
+                            "INDEX_TYPE", "COMMENT", "INDEX_COMMENT"];
+            let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+            for (db_name, db_arc) in dbs.iter() {
+                if db_name.starts_with("information_schema") || db_name.starts_with("performance_schema") { continue; }
+                if let Some(ref sf) = schema_filter4 { if !db_name.eq_ignore_ascii_case(sf) { continue; } }
+                let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                for (tname, table) in &db.tables {
+                    if let Some(pk_idx) = table.pk_col_idx {
+                        rows.push(vec![
+                            Some("def".into()), Some(db_name.clone()), Some(tname.clone()),
+                            Some("0".into()), Some(db_name.clone()), Some("PRIMARY".into()),
+                            Some("1".into()), Some(table.columns[pk_idx].name.clone()),
+                            Some("A".into()), Some(table.rows.len().to_string()),
+                            None, None, Some("".into()), Some("BTREE".into()), Some("".into()), Some("".into()),
                         ]);
                     }
                 }
@@ -396,6 +527,20 @@ impl Engine {
             return QueryResult::rows(cols, rows);
         }
 
+        // SHOW CREATE DATABASE
+        if sql_upper.starts_with("SHOW CREATE DATABASE") || sql_upper.starts_with("SHOW CREATE SCHEMA") {
+            let rest = if sql_upper.starts_with("SHOW CREATE DATABASE") {
+                sql[20..].trim().trim_matches('`').to_owned()
+            } else {
+                sql[19..].trim().trim_matches('`').to_owned()
+            };
+            let ddl = format!("CREATE DATABASE `{}` /*!40100 DEFAULT CHARACTER SET utf8mb4 */", rest);
+            return QueryResult::rows(
+                vec!["Database", "Create Database"],
+                vec![vec![Some(rest), Some(ddl)]],
+            );
+        }
+
         // SHOW VARIABLES (clients check these)
         if sql_upper.starts_with("SHOW VARIABLES") || sql_upper.starts_with("SHOW SESSION VARIABLES") {
             return QueryResult::rows(
@@ -412,6 +557,68 @@ impl Engine {
                     vec![Some("sql_mode".to_owned()), Some("STRICT_TRANS_TABLES".to_owned())],
                 ],
             );
+        }
+
+        // SHOW PROCESSLIST / SHOW FULL PROCESSLIST
+        if sql_upper.starts_with("SHOW PROCESSLIST") || sql_upper.starts_with("SHOW FULL PROCESSLIST") {
+            let cols = vec!["Id", "User", "Host", "db", "Command", "Time", "State", "Info"];
+            return QueryResult::rows(cols, Vec::<Vec<Option<String>>>::new());
+        }
+
+        // SHOW WARNINGS / SHOW ERRORS
+        if sql_upper.starts_with("SHOW WARNINGS") || sql_upper.starts_with("SHOW ERRORS") {
+            return QueryResult::rows(vec!["Level", "Code", "Message"], Vec::<Vec<Option<String>>>::new());
+        }
+
+        // SHOW INDEXES / SHOW INDEX / SHOW KEYS
+        if sql_upper.starts_with("SHOW INDEX") || sql_upper.starts_with("SHOW INDEXES") || sql_upper.starts_with("SHOW KEYS") {
+            // Parse: SHOW INDEX[ES] FROM table [FROM db]
+            let rest = sql_upper.trim_start_matches("SHOW").trim_start_matches("INDEXES").trim_start_matches("INDEX").trim_start_matches("KEYS").trim();
+            let rest = if rest.starts_with("FROM") { rest[4..].trim() } else { rest };
+            let rest_orig = sql.trim_start_matches(|c: char| c.is_whitespace())
+                .splitn(2, |c: char| c.is_whitespace()).nth(1).unwrap_or("")
+                .trim_start_matches(|c: char| c.is_whitespace())
+                .trim_start_matches("INDEXES").trim_start_matches("INDEX").trim_start_matches("KEYS")
+                .trim_start_matches(|c: char| c.is_whitespace())
+                .trim_start_matches("FROM").trim_start_matches("from")
+                .trim_start_matches(|c: char| c.is_whitespace());
+            // Extract table name (may be db.table)
+            let tname_raw: &str = rest_orig.split_whitespace().next().unwrap_or("").trim_matches('`');
+            let (idx_db, idx_table) = if let Some(dot) = tname_raw.find('.') {
+                (tname_raw[..dot].trim_matches('`').to_owned(), tname_raw[dot+1..].trim_matches('`').to_owned())
+            } else {
+                (current_db.clone().unwrap_or_else(|| "test".to_owned()), tname_raw.to_owned())
+            };
+            let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+            let cols = vec!["Table", "Non_unique", "Key_name", "Seq_in_index", "Column_name",
+                            "Collation", "Cardinality", "Sub_part", "Packed", "Null",
+                            "Index_type", "Comment", "Index_comment", "Visible"];
+            if let Some(db_arc) = dbs.get(&idx_db) {
+                let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+                if let Some(table) = db.tables.get(&idx_table) {
+                    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+                    // Primary key
+                    if let Some(pk_idx) = table.pk_col_idx {
+                        rows.push(vec![
+                            Some(idx_table.clone()),
+                            Some("0".to_owned()),         // Non_unique = 0 for PK
+                            Some("PRIMARY".to_owned()),   // Key_name
+                            Some("1".to_owned()),         // Seq_in_index
+                            Some(table.columns[pk_idx].name.clone()),
+                            Some("A".to_owned()),         // Collation
+                            Some(table.rows.len().to_string()), // Cardinality
+                            None, None,
+                            Some("".to_owned()),          // Null
+                            Some("BTREE".to_owned()),
+                            Some("".to_owned()),
+                            Some("".to_owned()),
+                            Some("YES".to_owned()),
+                        ]);
+                    }
+                    return QueryResult::rows(cols, rows);
+                }
+            }
+            return QueryResult::rows(cols, Vec::<Vec<Option<String>>>::new());
         }
 
         // SHOW STATUS
