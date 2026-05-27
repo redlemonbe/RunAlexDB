@@ -887,6 +887,32 @@ impl Engine {
                 op,
                 expr: Box::new(self.resolve_in_subqueries(db_name, *expr)),
             },
+            Expr::Subquery(subquery) => {
+                // Scalar subquery: execute and replace with the first-row first-column value
+                let scalar = match self.select(db_name, *subquery) {
+                    QueryResult::Rows { rows, .. } => rows.into_iter()
+                        .next().and_then(|r| r.into_iter().next().flatten()),
+                    QueryResult::ValueRows { rows, .. } => rows.into_iter()
+                        .next().and_then(|r| r.into_iter().next())
+                        .and_then(|v| v.to_display()),
+                    _ => None,
+                };
+                let span = sqlparser::tokenizer::Span {
+                    start: sqlparser::tokenizer::Location { line: 0, column: 0 },
+                    end: sqlparser::tokenizer::Location { line: 0, column: 0 },
+                };
+                Expr::Value(sqlparser::ast::ValueWithSpan {
+                    value: match scalar {
+                        None => sqlparser::ast::Value::Null,
+                        Some(s) => if s.parse::<i64>().is_ok() {
+                            sqlparser::ast::Value::Number(s, false)
+                        } else {
+                            sqlparser::ast::Value::SingleQuotedString(s)
+                        },
+                    },
+                    span,
+                })
+            }
             Expr::Nested(e) => Expr::Nested(Box::new(self.resolve_in_subqueries(db_name, *e))),
             other => other,
         }
@@ -1371,7 +1397,7 @@ impl Engine {
                 match fname.as_str() {
                     "COUNT" => Some(filtered.len().to_string()), // O(1) since filtered is already built
                     "MAX" => {
-                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_name = func.args.to_string().trim().trim_start_matches("(").trim_end_matches(")").trim().to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
                         col_idx.and_then(|idx| {
                             filtered.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
@@ -1380,7 +1406,7 @@ impl Engine {
                         })
                     }
                     "MIN" => {
-                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_name = func.args.to_string().trim().trim_start_matches("(").trim_end_matches(")").trim().to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
                         col_idx.and_then(|idx| {
                             filtered.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
@@ -1389,7 +1415,7 @@ impl Engine {
                         })
                     }
                     "SUM" => {
-                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_name = func.args.to_string().trim().trim_start_matches("(").trim_end_matches(")").trim().to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
                         col_idx.map(|idx| {
                             filtered.iter().filter_map(|r| r.get(idx)).filter_map(|v| {
@@ -1398,7 +1424,7 @@ impl Engine {
                         })
                     }
                     "AVG" => {
-                        let col_name = func.args.to_string().trim_matches(|c: char| c.is_whitespace()).to_owned();
+                        let col_name = func.args.to_string().trim().trim_start_matches("(").trim_end_matches(")").trim().to_owned();
                         let col_idx = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name));
                         col_idx.and_then(|idx| {
                             let nums: Vec<i64> = filtered.iter().filter_map(|r| r.get(idx))
@@ -1509,7 +1535,14 @@ impl Engine {
                     // Evaluate HAVING against the aggregate result — build a synthetic row
                     // HAVING COUNT(*) > N: compare out_rows aggregate values
                     // Simple implementation: only support HAVING COUNT(*) > N / = N
-                    let ok = eval_having_agg(having, &rows, &table.columns);
+                    // Build alias map from projection for HAVING alias resolution
+                    let mut alias_map: std::collections::HashMap<String, Expr> = std::collections::HashMap::new();
+                    for item in &sel.projection {
+                        if let SelectItem::ExprWithAlias { expr, alias } = item {
+                            alias_map.insert(alias.value.to_uppercase(), expr.clone());
+                        }
+                    }
+                    let ok = eval_having_agg(having, &rows, &table.columns, &alias_map);
                     if !ok { return None; }
                 }
                 Some(row_vals)
@@ -2348,7 +2381,7 @@ fn like_match(value: &str, pattern: &str) -> bool {
 }
 
 
-fn eval_having_agg_val(expr: &Expr, rows: &[&Row], cols: &[Column]) -> Value {
+fn eval_having_agg_val(expr: &Expr, rows: &[&Row], cols: &[Column], alias_map: &std::collections::HashMap<String, Expr>) -> Value {
     match expr {
         Expr::Function(f) => {
             let fname = f.name.to_string().to_uppercase();
@@ -2390,6 +2423,10 @@ fn eval_having_agg_val(expr: &Expr, rows: &[&Row], cols: &[Column]) -> Value {
         }
         Expr::Value(vs) => expr_to_value(Expr::Value(vs.clone())),
         Expr::Identifier(id) => {
+            // Check alias map first (for HAVING with projected aliases)
+            if let Some(aliased_expr) = alias_map.get(&id.value.to_uppercase()) {
+                return eval_having_agg_val(aliased_expr, rows, cols, alias_map);
+            }
             if let Some(ci) = cols.iter().position(|c| c.name.eq_ignore_ascii_case(&id.value)) {
                 rows.first().and_then(|r| r.get(ci)).cloned().unwrap_or(Value::Null)
             } else { Value::Null }
@@ -2398,15 +2435,15 @@ fn eval_having_agg_val(expr: &Expr, rows: &[&Row], cols: &[Column]) -> Value {
     }
 }
 
-fn eval_having_agg(expr: &Expr, rows: &[&Row], cols: &[Column]) -> bool {
+fn eval_having_agg(expr: &Expr, rows: &[&Row], cols: &[Column], alias_map: &std::collections::HashMap<String, Expr>) -> bool {
     match expr {
         Expr::BinaryOp { left, op, right } => {
             match op {
-                BinaryOperator::And => eval_having_agg(left, rows, cols) && eval_having_agg(right, rows, cols),
-                BinaryOperator::Or  => eval_having_agg(left, rows, cols) || eval_having_agg(right, rows, cols),
+                BinaryOperator::And => eval_having_agg(left, rows, cols, alias_map) && eval_having_agg(right, rows, cols, alias_map),
+                BinaryOperator::Or  => eval_having_agg(left, rows, cols, alias_map) || eval_having_agg(right, rows, cols, alias_map),
                 op => {
-                    let lv = eval_having_agg_val(left, rows, cols);
-                    let rv = eval_having_agg_val(right, rows, cols);
+                    let lv = eval_having_agg_val(left, rows, cols, alias_map);
+                    let rv = eval_having_agg_val(right, rows, cols, alias_map);
                     match op {
                         BinaryOperator::Eq    => values_eq(&lv, &rv),
                         BinaryOperator::NotEq => !values_eq(&lv, &rv),
@@ -2419,7 +2456,7 @@ fn eval_having_agg(expr: &Expr, rows: &[&Row], cols: &[Column]) -> bool {
                 }
             }
         }
-        Expr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Not) => !eval_having_agg(expr, rows, cols),
+        Expr::UnaryOp { op, expr } if matches!(op, UnaryOperator::Not) => !eval_having_agg(expr, rows, cols, alias_map),
         _ => true,
     }
 }
