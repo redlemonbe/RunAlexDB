@@ -2428,7 +2428,7 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                         _ => Value::Null,
                     }
                 }
-                ShiftLeft => {
+                PGBitwiseShiftLeft => {
                     let l = eval_row_expr(row, cols, left);
                     let r = eval_row_expr(row, cols, right);
                     match (l, r) {
@@ -2436,7 +2436,7 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                         _ => Value::Null,
                     }
                 }
-                ShiftRight => {
+                PGBitwiseShiftRight => {
                     let l = eval_row_expr(row, cols, left);
                     let r = eval_row_expr(row, cols, right);
                     match (l, r) {
@@ -2492,6 +2492,57 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                         (Value::Text(a), Value::Text(b)) if matches!(op, Plus) => Value::Text(a + &b),
                         _ => Value::Null,
                     }
+                }
+                Eq => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    Value::Int(values_eq(&l, &r) as i64)
+                }
+                NotEq => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    Value::Int(!values_eq(&l, &r) as i64)
+                }
+                Gt => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    Value::Int((values_cmp(&l, &r) == std::cmp::Ordering::Greater) as i64)
+                }
+                GtEq => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    Value::Int((values_cmp(&l, &r) != std::cmp::Ordering::Less) as i64)
+                }
+                Lt => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    Value::Int((values_cmp(&l, &r) == std::cmp::Ordering::Less) as i64)
+                }
+                LtEq => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    Value::Int((values_cmp(&l, &r) != std::cmp::Ordering::Greater) as i64)
+                }
+                And => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    let lb = matches!(&l, Value::Int(n) if *n != 0) || matches!(&l, Value::Text(s) if !s.is_empty() && s != "0");
+                    let rb = matches!(&r, Value::Int(n) if *n != 0) || matches!(&r, Value::Text(s) if !s.is_empty() && s != "0");
+                    Value::Int((lb && rb) as i64)
+                }
+                Or => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    let lb = matches!(&l, Value::Int(n) if *n != 0) || matches!(&l, Value::Text(s) if !s.is_empty() && s != "0");
+                    let rb = matches!(&r, Value::Int(n) if *n != 0) || matches!(&r, Value::Text(s) if !s.is_empty() && s != "0");
+                    Value::Int((lb || rb) as i64)
+                }
+                Xor => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    let lb = matches!(&l, Value::Int(n) if *n != 0);
+                    let rb = matches!(&r, Value::Int(n) if *n != 0);
+                    Value::Int((lb ^ rb) as i64)
                 }
                 _ => Value::Null,
             }
@@ -2624,6 +2675,58 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                             };
                             return result.map(Value::Text).unwrap_or(Value::Null);
                         }
+                    }
+                }
+                return Value::Null;
+            }
+            // TIMESTAMPDIFF(unit, date1, date2): unit is Identifier, not a value
+            if fname.as_str() == "TIMESTAMPDIFF" {
+                if let sqlparser::ast::FunctionArguments::List(ref list) = f.args {
+                    let unit = list.args.get(0).and_then(|a| match a {
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Identifier(id))) => Some(id.value.to_uppercase()),
+                        _ => None,
+                    }).unwrap_or_else(|| "DAY".to_owned());
+                    let d1_str = list.args.get(1).and_then(|a| match a {
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => eval_row_expr(row, cols, e).into_text(),
+                        _ => None,
+                    });
+                    let d2_str = list.args.get(2).and_then(|a| match a {
+                        sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => eval_row_expr(row, cols, e).into_text(),
+                        _ => None,
+                    });
+                    let parse_ym = |s: &str| -> Option<(i64, i64, i64)> {
+                        let dp = s.trim().split_whitespace().next()?;
+                        let mut p = dp.splitn(3, '-');
+                        let y: i64 = p.next()?.parse().ok()?;
+                        let m: i64 = p.next()?.parse().ok()?;
+                        let d: i64 = p.next()?.parse().ok()?;
+                        Some((y, m, d))
+                    };
+                    if let (Some(s1), Some(s2)) = (d1_str, d2_str) {
+                        let result = match unit.as_str() {
+                            "YEAR" => {
+                                parse_ym(&s2).and_then(|(y2,_,_)| parse_ym(&s1).map(|(y1,_,_)| Value::Int(y2 - y1)))
+                            }
+                            "MONTH" => {
+                                parse_ym(&s2).and_then(|(y2,m2,_)| parse_ym(&s1).map(|(y1,m1,_)| Value::Int((y2-y1)*12 + (m2-m1))))
+                            }
+                            "WEEK" => {
+                                parse_date_str(&s2).and_then(|d2| parse_date_str(&s1).map(|d1| Value::Int((d2-d1)/7)))
+                            }
+                            "HOUR" => {
+                                parse_date_str(&s2).and_then(|d2| parse_date_str(&s1).map(|d1| Value::Int((d2-d1)*24)))
+                            }
+                            "MINUTE" => {
+                                parse_date_str(&s2).and_then(|d2| parse_date_str(&s1).map(|d1| Value::Int((d2-d1)*24*60)))
+                            }
+                            "SECOND" => {
+                                parse_date_str(&s2).and_then(|d2| parse_date_str(&s1).map(|d1| Value::Int((d2-d1)*86400)))
+                            }
+                            _ => { // DAY default
+                                parse_date_str(&s2).and_then(|d2| parse_date_str(&s1).map(|d1| Value::Int(d2-d1)))
+                            }
+                        };
+                        return result.unwrap_or(Value::Null);
                     }
                 }
                 return Value::Null;
