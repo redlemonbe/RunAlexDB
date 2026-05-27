@@ -1963,6 +1963,104 @@ impl Engine {
                     expr_proj.iter().map(|(_, e)| eval_row_expr(row, &table.columns, e).to_display()).collect()
                 })
                 .collect();
+            // ── Window function post-processing ─────────────────────────────
+            {
+                struct WinItem { col_idx: usize, fname: String, pb_cols: Vec<String>, ob_cols: Vec<(String, bool)> }
+                let win_items: Vec<WinItem> = expr_proj.iter().enumerate()
+                    .filter_map(|(idx, (_, e))| {
+                        if let Expr::Function(f) = e {
+                            if let Some(sqlparser::ast::WindowType::WindowSpec(ws)) = &f.over {
+                                return Some(WinItem {
+                                    col_idx: idx,
+                                    fname: f.name.to_string().to_uppercase(),
+                                    pb_cols: ws.partition_by.iter().map(|pe| pe.to_string()).collect(),
+                                    ob_cols: ws.order_by.iter().map(|oe| (oe.expr.to_string(), oe.options.asc.unwrap_or(true))).collect(),
+                                });
+                            }
+                        }
+                        None
+                    }).collect();
+                if !win_items.is_empty() {
+                    let n_rows = result_rows.len();
+                    for wi in &win_items {
+                        let col_idx = wi.col_idx;
+                        // Partition keys
+                        let pkeys: Vec<String> = result_rows.iter().map(|row| {
+                            wi.pb_cols.iter().map(|cname| {
+                                let pos = col_names.iter().position(|n| n.eq_ignore_ascii_case(cname));
+                                pos.and_then(|p| row.get(p)).and_then(|v| v.as_deref()).unwrap_or("").to_owned()
+                            }).collect::<Vec<_>>().join("\x00")
+                        }).collect();
+                        // Group row indices by partition
+                        let mut pk_rows: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+                        for ri in 0..n_rows { pk_rows.entry(pkeys[ri].clone()).or_default().push(ri); }
+                        // Sort each partition by OVER ORDER BY (if any)
+                        for indices in pk_rows.values_mut() {
+                            if !wi.ob_cols.is_empty() {
+                                let ob = &wi.ob_cols;
+                                let rows = &result_rows;
+                                let cn = &col_names;
+                                indices.sort_by(|&a, &b| {
+                                    for (cname, asc) in ob {
+                                        let pos = cn.iter().position(|n| n.eq_ignore_ascii_case(cname));
+                                        let av = pos.and_then(|p| rows[a].get(p)).and_then(|v| v.as_deref()).unwrap_or("");
+                                        let bv = pos.and_then(|p| rows[b].get(p)).and_then(|v| v.as_deref()).unwrap_or("");
+                                        let ord = match (av.parse::<f64>(), bv.parse::<f64>()) {
+                                            (Ok(a), Ok(b)) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+                                            _ => av.cmp(bv),
+                                        };
+                                        let ord = if *asc { ord } else { ord.reverse() };
+                                        if ord != std::cmp::Ordering::Equal { return ord; }
+                                    }
+                                    std::cmp::Ordering::Equal
+                                });
+                            }
+                        }
+                        // Assign values
+                        let row_ranks: Vec<usize> = {
+                            let mut v = vec![0usize; n_rows];
+                            for indices in pk_rows.values() {
+                                for (pos, &ri) in indices.iter().enumerate() { v[ri] = pos + 1; }
+                            }
+                            v
+                        };
+                        match wi.fname.as_str() {
+                            "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => {
+                                for (ri, row) in result_rows.iter_mut().enumerate() {
+                                    if col_idx < row.len() { row[col_idx] = Some(row_ranks[ri].to_string()); }
+                                }
+                            }
+                            "COUNT" => {
+                                for indices in pk_rows.values() {
+                                    let sz = indices.len();
+                                    for &ri in indices {
+                                        if col_idx < result_rows[ri].len() { result_rows[ri][col_idx] = Some(sz.to_string()); }
+                                    }
+                                }
+                            }
+                            "SUM" => {
+                                for indices in pk_rows.values() {
+                                    let s: f64 = indices.iter().filter_map(|&ri| result_rows[ri].get(col_idx)).filter_map(|v| v.as_deref()).filter_map(|s| s.parse::<f64>().ok()).sum();
+                                    let sv = if s == s.floor() { format!("{:.0}", s) } else { s.to_string() };
+                                    for &ri in indices {
+                                        if col_idx < result_rows[ri].len() { result_rows[ri][col_idx] = Some(sv.clone()); }
+                                    }
+                                }
+                            }
+                            "AVG" => {
+                                for indices in pk_rows.values() {
+                                    let vs: Vec<f64> = indices.iter().filter_map(|&ri| result_rows[ri].get(col_idx)).filter_map(|v| v.as_deref()).filter_map(|s| s.parse::<f64>().ok()).collect();
+                                    let avg = if vs.is_empty() { 0.0 } else { vs.iter().sum::<f64>() / vs.len() as f64 };
+                                    for &ri in indices {
+                                        if col_idx < result_rows[ri].len() { result_rows[ri][col_idx] = Some(avg.to_string()); }
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             // ORDER BY
             if let Some(ob) = &query.order_by {
                 if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
