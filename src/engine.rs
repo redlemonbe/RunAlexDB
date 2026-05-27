@@ -443,9 +443,44 @@ impl Engine {
                 let db_name = current_db.as_deref().unwrap_or("test");
                 self.select(db_name, *q)
             }
-            Statement::Drop { object_type, names, .. } => {
-                let _ = (object_type, names); // TODO
-                QueryResult::ok(0, 0)
+            Statement::Drop { object_type, names, if_exists, .. } => {
+                use sqlparser::ast::ObjectType;
+                let db_name = current_db.as_deref().unwrap_or("test");
+                match object_type {
+                    ObjectType::Table => {
+                        let mut dbs = self.databases.write().unwrap_or_else(|e| e.into_inner());
+                        for name in &names {
+                            let raw = name.to_string();
+                            let (tdb, tname) = if let Some(dot) = raw.find('.') {
+                                (raw[..dot].trim_matches('`').to_owned(), raw[dot+1..].trim_matches('`').to_owned())
+                            } else {
+                                (db_name.to_owned(), raw.trim_matches('`').to_owned())
+                            };
+                            if let Some(db_arc) = dbs.get(&tdb) {
+                                let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+                                if db.tables.remove(&tname).is_none() && !if_exists {
+                                    return QueryResult::err(1051, &format!("Unknown table '{}.{}'", tdb, tname));
+                                }
+                            } else if !if_exists {
+                                return QueryResult::err(1049, &format!("Unknown database '{}'", tdb));
+                            }
+                        }
+                        self.bump_write_gen();
+                        QueryResult::ok(0, 0)
+                    }
+                    ObjectType::Database | ObjectType::Schema => {
+                        let mut dbs = self.databases.write().unwrap_or_else(|e| e.into_inner());
+                        for name in &names {
+                            let dbname = name.to_string().trim_matches('`').to_owned();
+                            if dbs.remove(&dbname).is_none() && !if_exists {
+                                return QueryResult::err(1049, &format!("Unknown database '{}'", dbname));
+                            }
+                        }
+                        self.bump_write_gen();
+                        QueryResult::ok(0, 0)
+                    }
+                    _ => QueryResult::ok(0, 0),
+                }
             }
             Statement::Update { table, assignments, selection, .. } => {
                 let db_name = current_db.as_deref().unwrap_or("test");
@@ -1040,9 +1075,33 @@ impl Engine {
     }
 
     fn select(&self, db_name: &str, query: Query) -> QueryResult {
-        let SetExpr::Select(sel) = *query.body else {
-            return QueryResult::err(1295, "Complex SELECT not yet supported");
+        // Separate body to allow matching before consuming
+        let body = query.body;
+        let sel = match *body {
+            SetExpr::SetOperation { op, set_quantifier, left, right } => {
+                use sqlparser::ast::{SetOperator, SetQuantifier};
+                let is_all = matches!(set_quantifier, SetQuantifier::All);
+                let mk_q = |b: Box<SetExpr>| Query { body: b, order_by: None, limit: None, offset: None, with: None, limit_by: vec![], fetch: None, locks: vec![], for_clause: None, settings: None, format_clause: None };
+                let lr = self.select(db_name, mk_q(left));
+                let rr = self.select(db_name, mk_q(right));
+                let (cols, mut rows): (Vec<String>, Vec<Vec<Option<String>>>) = match lr {
+                    QueryResult::Rows { columns, rows } => (columns, rows),
+                    QueryResult::ValueRows { columns, rows } => (columns, rows.into_iter().map(|r| r.into_iter().map(|v| v.to_display()).collect()).collect()),
+                    other => return other,
+                };
+                let right_rows: Vec<Vec<Option<String>>> = match rr {
+                    QueryResult::Rows { rows, .. } => rows,
+                    QueryResult::ValueRows { rows, .. } => rows.into_iter().map(|r| r.into_iter().map(|v| v.to_display()).collect()).collect(),
+                    other => return other,
+                };
+                rows.extend(right_rows);
+                if !is_all { rows.dedup(); }
+                return QueryResult::Rows { columns: cols, rows };
+            }
+            SetExpr::Select(s) => s,
+            _ => return QueryResult::err(1295, "Complex SELECT not yet supported"),
         };
+
 
         if sel.from.is_empty() {
             let cols: Vec<String> = sel.projection.iter().map(|p| p.to_string()).collect();
