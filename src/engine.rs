@@ -250,6 +250,17 @@ impl Engine {
                 vec![vec![Some(String::from("8.0.32-RunAlexDB"))]],
             );
         }
+        if sql_upper.trim_end_matches(';') == "SELECT DATABASE()"
+            || sql_upper.trim_end_matches(';') == "SELECT SCHEMA()"
+            || sql_upper.trim_end_matches(';') == "SELECT DATABASE() AS DATABASE()"
+        {
+            let db = current_db.as_deref().unwrap_or("");
+            let col = if sql_upper.contains("SCHEMA") { "SCHEMA()" } else { "DATABASE()" };
+            return QueryResult::rows(
+                vec![col],
+                vec![vec![if db.is_empty() { None } else { Some(db.to_owned()) }]],
+            );
+        }
         // ── User DDL (not in sqlparser) ──────────────────────────────────────
         if sql_upper.starts_with("CREATE USER") {
             return self.exec_create_user(sql.trim());
@@ -445,9 +456,15 @@ impl Engine {
                 }
             }
         }
+        let mut eff_db: Option<String> = current_db.clone();
         let mut last = QueryResult::ok(0, 0);
         for stmt in stmts.iter() {
-            last = self.exec_stmt(stmt.clone(), current_db);
+            // Track USE db changes within a multi-statement batch
+            if let Statement::Use(sqlparser::ast::Use::Object(obj_name)) = stmt {
+                let db = obj_name.to_string();
+                eff_db = Some(db.trim_matches('`').to_owned());
+            }
+            last = self.exec_stmt(stmt.clone(), &eff_db);
             // Bump write generation for DML (enables L0 cache cross-connection invalidation)
             if matches!(last, QueryResult::Ok { .. }) {
                 self.bump_write_gen();
@@ -1270,19 +1287,38 @@ impl Engine {
 
 
         if sel.from.is_empty() {
-            let cols: Vec<String> = sel.projection.iter().map(|p| p.to_string()).collect();
+            let cols: Vec<String> = sel.projection.iter().map(|p| match p {
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                _ => p.to_string(),
+            }).collect();
+            let last_id = self.last_insert_id.load(std::sync::atomic::Ordering::Relaxed);
             let vals: Vec<Option<String>> = sel.projection.iter().map(|p| {
-                match p {
-                    SelectItem::UnnamedExpr(Expr::Value(ref vs)) => {
-                        Some(vs.value.to_string().trim_matches('\'').to_owned())
+                let expr = match p {
+                    SelectItem::UnnamedExpr(e) => e,
+                    SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => return Some(p.to_string()),
+                };
+                match expr {
+                    Expr::Value(ref vs) => Some(vs.value.to_string().trim_matches('\'').to_owned()),
+                    Expr::Function(f) => {
+                        let fname = f.name.to_string().to_uppercase();
+                        match fname.as_str() {
+                            "DATABASE" | "SCHEMA" => {
+                                if db_name.is_empty() { None } else { Some(db_name.to_owned()) }
+                            }
+                            "VERSION" => Some("8.0.32-RunAlexDB".to_owned()),
+                            "USER" | "CURRENT_USER" | "SESSION_USER" | "SYSTEM_USER" => Some("root@localhost".to_owned()),
+                            "CONNECTION_ID" => Some("1".to_owned()),
+                            "ROW_COUNT" => Some("0".to_owned()),
+                            "LAST_INSERT_ID" => Some(last_id.to_string()),
+                            _ => Some(eval_row_expr(&Vec::<Value>::new(), &[], expr).to_display().unwrap_or_else(|| f.to_string())),
+                        }
                     }
-                    SelectItem::UnnamedExpr(Expr::Function(f)) => Some(f.to_string()),
-                    _ => Some(p.to_string()),
+                    _ => Some(eval_row_expr(&Vec::<Value>::new(), &[], expr).to_display().unwrap_or_else(|| expr.to_string())),
                 }
             }).collect();
             return QueryResult::rows(cols, vec![vals]);
         }
-
         let raw_table = sel.from[0].relation.to_string();
         let (sel_db, table_name) = if let Some(dot) = raw_table.find('.') {
             (raw_table[..dot].trim_matches('`').to_owned(), raw_table[dot+1..].trim_matches('`').to_owned())

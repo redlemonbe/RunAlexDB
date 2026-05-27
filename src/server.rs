@@ -238,7 +238,7 @@ where
                 (&rest[1..1 + len.min(rest.len() - 1)], &rest[1 + len.min(rest.len() - 1)..])
             };
             // Multi-user auth: check username against user table
-            let username_str = _username.trim_matches(' ').to_owned();
+            let username_str = _username.trim_matches('`').to_owned();
             effective_user = if username_str.is_empty() { "root".to_owned() } else { username_str.clone() };
             let auth_ok = {
                 // Try user table first
@@ -324,6 +324,7 @@ where
                 }
                 Command::InitDb(db_name) => {
                     current_db = Some(db_name);
+                    l0_hash = 0; // invalidate L0 cache: current_db changed
                     stream.write_all(&encode_packet(&ok_packet(0, 0), 1)).await?;
                 }
                 Command::Query(sql) => {
@@ -334,8 +335,11 @@ where
                         continue;
                     }
                     if sql_up.starts_with("USE ") {
-                        let db_name = sql.trim()[4..].trim().trim_matches(';').trim_matches('`').to_owned();
-                        current_db = Some(db_name);
+                        let rest = sql.trim()[4..].trim();
+                        if !rest.contains(';') {
+                            let db_name = rest.trim_matches('`').to_owned();
+                            current_db = Some(db_name);
+                        }
                     }
                     // L0 result cache: CRC32 hash query, check write_gen for staleness.
                     // Hit: return pre-serialized bytes — zero SQL parsing, zero encoding.
