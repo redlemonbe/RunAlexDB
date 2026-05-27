@@ -816,9 +816,6 @@ impl Engine {
         let Some(source) = source else {
             return QueryResult::err(1064, "INSERT without VALUES");
         };
-        let SetExpr::Values(Values { rows, .. }) = *source.body else {
-            return QueryResult::err(1064, "Only VALUES inserts supported");
-        };
 
         // Handle db.table qualified names
         let (eff_db, eff_table) = if let Some(dot) = table_name.find('.') {
@@ -828,6 +825,60 @@ impl Engine {
         };
         let db_name = &eff_db;
         let table_name = &eff_table;
+
+        // Resolve source rows — either VALUES(...) or INSERT ... SELECT ...
+        let source_rows: Vec<Row> = match *source.body {
+            SetExpr::Values(Values { rows, .. }) => {
+                rows.into_iter().map(|exprs| exprs.into_iter().map(expr_to_value).collect()).collect()
+            }
+            body => {
+                // INSERT ... SELECT: execute the subquery first (no locks held)
+                // Preserve ORDER BY / LIMIT from the original source query by reconstructing it.
+                // source.order_by/limit were already consumed in the Box<Query> via source_query.
+                let q = sqlparser::ast::Query {
+                    body: Box::new(body),
+                    order_by: source.order_by,
+                    limit: source.limit,
+                    offset: source.offset,
+                    with: source.with,
+                    limit_by: source.limit_by,
+                    fetch: source.fetch,
+                    locks: source.locks,
+                    for_clause: source.for_clause,
+                    settings: source.settings,
+                    format_clause: source.format_clause,
+                };
+                // Get target column types for type coercion
+                let col_types: Vec<ColumnType> = {
+                    let dbs_r = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                    dbs_r.get(db_name.as_str())
+                        .and_then(|a| {
+                            let db2 = a.read().unwrap_or_else(|e| e.into_inner());
+                            db2.tables.get(table_name.as_str()).map(|t| t.columns.iter().map(|c| c.col_type.clone()).collect())
+                        })
+                        .unwrap_or_default()
+                };
+                let result = self.select(db_name.as_str(), q);
+                let str_rows = match result {
+                    QueryResult::Rows { rows, .. } => rows,
+                    QueryResult::ValueRows { rows, .. } => rows.into_iter().map(|r| r.into_iter().map(|v| v.to_display()).collect()).collect(),
+                    other => return other,
+                };
+                str_rows.into_iter().map(|row| {
+                    row.into_iter().enumerate().map(|(i, v)| {
+                        match (v, col_types.get(i)) {
+                            (None, _) => Value::Null,
+                            (Some(s), Some(ColumnType::Int) | Some(ColumnType::BigInt)) =>
+                                Value::Int(s.parse().unwrap_or(0)),
+                            (Some(s), Some(ColumnType::Float)) =>
+                                Value::Float(s.parse().unwrap_or(0.0)),
+                            (Some(s), _) => Value::Text(s),
+                        }
+                    }).collect()
+                }).collect()
+            }
+        };
+
         let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
         let Some(db_arc) = dbs.get(db_name.as_str()) else {
             return QueryResult::err(1049, &format!("Unknown database '{db_name}'"));
@@ -837,9 +888,9 @@ impl Engine {
             return QueryResult::err(1146, &format!("Table '{db_name}.{table_name}' doesn't exist"));
         };
 
-        let count = rows.len() as u64;
-        for row_exprs in rows {
-            let row: Row = row_exprs.into_iter().map(expr_to_value).collect();
+        let count = source_rows.len() as u64;
+        for row in source_rows {
+            let row: Row = row;
             // REPLACE INTO: remove existing row with same PK before inserting
             if replace_into {
                 if let Some(pk_idx) = table.pk_col_idx {
@@ -1004,10 +1055,38 @@ impl Engine {
 
         drop(dbs);
 
-        let filtered: Vec<Row> = combined_rows
+        let mut filtered: Vec<Row> = combined_rows
             .into_iter()
             .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &combined_cols, w)))
             .collect();
+
+        // Pre-projection sort: handle ORDER BY on columns not in SELECT list
+        if let Some(ob) = &order_by {
+            if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+                let src_keys: Vec<(usize, bool)> = exprs.iter().rev().filter_map(|oe| {
+                    let col_name = match &oe.expr {
+                        Expr::Identifier(id) => id.value.clone(),
+                        Expr::CompoundIdentifier(parts) =>
+                            parts.last().map(|i| i.value.clone()).unwrap_or_default(),
+                        other => other.to_string(),
+                    };
+                    let asc = oe.options.asc.unwrap_or(true);
+                    combined_cols.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                        .map(|idx| (idx, asc))
+                }).collect();
+                for (cidx, asc) in src_keys {
+                    filtered.sort_by(|a, b| {
+                        let av = a.get(cidx).and_then(|v| v.to_display()).unwrap_or_default();
+                        let bv = b.get(cidx).and_then(|v| v.to_display()).unwrap_or_default();
+                        let ord = match (av.parse::<i64>(), bv.parse::<i64>()) {
+                            (Ok(xi), Ok(yi)) => xi.cmp(&yi),
+                            _ => av.cmp(&bv),
+                        };
+                        if asc { ord } else { ord.reverse() }
+                    });
+                }
+            }
+        }
 
         let is_wildcard = sel.projection.iter().any(|p| {
             matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))
@@ -1484,48 +1563,44 @@ impl Engine {
         }
 
         // Fallback String path (ORDER BY / LIMIT need comparable String values)
-        let mut result_rows: Vec<Vec<Option<String>>> = if let Some(ref idxs) = simd_indices {
-            idxs.iter()
-                .filter_map(|&ri| table.rows.get(ri))
-                .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
-                .collect()
+        // Collect source row references first so ORDER BY can access non-projected columns
+        let mut src_rows: Vec<&Row> = if let Some(ref idxs) = simd_indices {
+            idxs.iter().filter_map(|&ri| table.rows.get(ri)).collect()
         } else {
             table.rows.iter()
                 .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
-                .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
                 .collect()
         };
 
-        // ORDER BY
+        // ORDER BY: sort source rows before projection so non-projected columns are accessible
         if let Some(ob) = &query.order_by {
             if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
                 for order_expr in exprs.iter().rev() {
-                    let col_name = order_expr.expr.to_string();
+                    let col_name = match &order_expr.expr {
+                        Expr::Identifier(id) => id.value.clone(),
+                        Expr::CompoundIdentifier(parts) =>
+                            parts.last().map(|i| i.value.clone()).unwrap_or_default(),
+                        other => other.to_string(),
+                    };
                     if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
                         let asc = order_expr.options.asc.unwrap_or(true);
-                        let proj_idx = proj_cols.iter().position(|(_, i)| *i == idx);
-                        if let Some(pidx) = proj_idx {
-                            result_rows.sort_by(|a, b| {
-                                let av = a.get(pidx).and_then(|x| x.as_deref());
-                                let bv = b.get(pidx).and_then(|x| x.as_deref());
-                                let ord = match (av, bv) {
-                                    (Some(x), Some(y)) => {
-                                        match (x.parse::<i64>(), y.parse::<i64>()) {
-                                            (Ok(xi), Ok(yi)) => xi.cmp(&yi),
-                                            _ => x.cmp(y),
-                                        }
-                                    }
-                                    (None, Some(_)) => std::cmp::Ordering::Less,
-                                    (Some(_), None) => std::cmp::Ordering::Greater,
-                                    (None, None) => std::cmp::Ordering::Equal,
-                                };
-                                if asc { ord } else { ord.reverse() }
-                            });
-                        }
+                        src_rows.sort_by(|a, b| {
+                            let av = a.get(idx).and_then(|v| v.to_display()).unwrap_or_default();
+                            let bv = b.get(idx).and_then(|v| v.to_display()).unwrap_or_default();
+                            let ord = match (av.parse::<i64>(), bv.parse::<i64>()) {
+                                (Ok(xi), Ok(yi)) => xi.cmp(&yi),
+                                _ => av.cmp(&bv),
+                            };
+                            if asc { ord } else { ord.reverse() }
+                        });
                     }
                 }
             }
         }
+
+        let mut result_rows: Vec<Vec<Option<String>>> = src_rows.iter()
+            .map(|row| proj_cols.iter().map(|(_, idx)| row.get(*idx).and_then(|v| v.to_display())).collect())
+            .collect();
 
         // LIMIT / OFFSET
         let offset = query.offset.as_ref().and_then(|o| {
