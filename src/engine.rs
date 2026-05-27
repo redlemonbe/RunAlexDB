@@ -2259,6 +2259,43 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
         }
         Expr::Function(f) => {
             let fname = f.name.to_string().to_uppercase();
+            // DATE_ADD/DATE_SUB: second arg is Expr::Interval, must be accessed directly
+            if matches!(fname.as_str(), "DATE_ADD" | "ADDDATE" | "DATE_SUB" | "SUBDATE") {
+                let is_sub = matches!(fname.as_str(), "DATE_SUB" | "SUBDATE");
+                if let sqlparser::ast::FunctionArguments::List(ref list) = f.args {
+                    if let (Some(date_a), Some(intv_a)) = (list.args.get(0), list.args.get(1)) {
+                        let date_val = match date_a {
+                            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => eval_row_expr(row, cols, e).into_text(),
+                            _ => None,
+                        };
+                        let interval_info = match intv_a {
+                            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(Expr::Interval(iv))) => {
+                                let n = match eval_row_expr(row, cols, &iv.value) {
+                                    Value::Int(n) => n,
+                                    Value::Text(s) => s.parse::<i64>().unwrap_or(0),
+                                    _ => 0i64,
+                                };
+                                let unit = iv.leading_field.as_ref().map(|f| format!("{}", f).to_uppercase()).unwrap_or_else(|| "DAY".to_owned());
+                                Some((n, unit))
+                            }
+                            _ => None,
+                        };
+                        if let (Some(ds), Some((n, unit))) = (date_val, interval_info) {
+                            let sign: i64 = if is_sub { -1 } else { 1 };
+                            let result = match unit.as_str() {
+                                "DAY" | "DAYS" => date_add_days(&ds, sign * n),
+                                "WEEK" | "WEEKS" => date_add_days(&ds, sign * n * 7),
+                                "MONTH" | "MONTHS" => add_months(&ds, sign * n),
+                                "YEAR" | "YEARS" => add_months(&ds, sign * n * 12),
+                                "HOUR" | "HOURS" => date_add_days(&ds, sign * n / 24),
+                                _ => date_add_days(&ds, sign * n),
+                            };
+                            return result.map(Value::Text).unwrap_or(Value::Null);
+                        }
+                    }
+                }
+                return Value::Null;
+            }
             let args: Vec<Value> = match &f.args {
                 sqlparser::ast::FunctionArguments::List(list) => {
                     list.args.iter().map(|a| match a {
@@ -2441,6 +2478,146 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                 "DAY" | "DAYOFMONTH" => args.into_iter().next().and_then(|v| v.into_text()).and_then(|s| {
                     s.splitn(4, '-').nth(2).and_then(|d| d.split(' ').next()).and_then(|d| d.parse::<i64>().ok()).map(Value::Int)
                 }).unwrap_or(Value::Null),
+                "DATEDIFF" => {
+                    let mut it = args.into_iter();
+                    let d1 = it.next().and_then(|v| v.into_text());
+                    let d2 = it.next().and_then(|v| v.into_text());
+                    match (d1.as_deref().and_then(parse_date_str), d2.as_deref().and_then(parse_date_str)) {
+                        (Some(a), Some(b)) => Value::Int(a - b),
+                        _ => Value::Null,
+                    }
+                }
+                "TIMESTAMPDIFF" => {
+                    // TIMESTAMPDIFF(unit, date1, date2) — need direct AST access for unit
+                    // unit is first arg as identifier, not a value
+                    Value::Null // TODO: implement via raw AST
+                }
+                "DATE_FORMAT" => {
+                    let mut it = args.into_iter();
+                    let d = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let fmt = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    if d.is_empty() { Value::Null } else { Value::Text(mysql_date_format(&d, &fmt)) }
+                }
+                "DATE" => {
+                    args.into_iter().next().and_then(|v| v.into_text())
+                        .map(|s| Value::Text(s.split_whitespace().next().unwrap_or("").to_owned()))
+                        .unwrap_or(Value::Null)
+                }
+                "TIME" => {
+                    args.into_iter().next().and_then(|v| v.into_text())
+                        .map(|s| Value::Text(s.split_whitespace().nth(1).unwrap_or("00:00:00").to_owned()))
+                        .unwrap_or(Value::Null)
+                }
+                "STR_TO_DATE" => {
+                    // Simplified: parse YYYY-MM-DD or DD/MM/YYYY etc.
+                    // For now, just return the first arg as-is if it looks like a date
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let fmt = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    // Simple: if fmt = %Y-%m-%d, pass through; otherwise try to normalize
+                    if s.is_empty() { Value::Null }
+                    else if fmt.contains("%Y") && fmt.contains("%m") && fmt.contains("%d") {
+                        // Parse using format
+                        let mut y = 0i64; let mut m = 0i64; let mut d = 0i64;
+                        let mut fi = fmt.chars().peekable();
+                        let mut si = s.chars().peekable();
+                        while let Some(fc) = fi.next() {
+                            if fc == '%' {
+                                let code = fi.next().unwrap_or(' ');
+                                let num: String = si.by_ref().take_while(|c| c.is_ascii_digit()).collect();
+                                match code {
+                                    'Y' => y = num.parse().unwrap_or(0),
+                                    'y' => y = num.parse::<i64>().unwrap_or(0) + 2000,
+                                    'm' | 'c' => m = num.parse().unwrap_or(0),
+                                    'd' | 'e' => d = num.parse().unwrap_or(0),
+                                    _ => {}
+                                }
+                            } else { si.next(); }
+                        }
+                        if y > 0 && m > 0 && d > 0 {
+                            Value::Text(format!("{:04}-{:02}-{:02}", y, m, d))
+                        } else { Value::Null }
+                    } else { Value::Text(s) }
+                }
+                "FORMAT" => {
+                    let mut it = args.into_iter();
+                    let num = it.next().unwrap_or(Value::Null);
+                    let decimals = it.next().and_then(|v| if let Value::Int(n) = v { Some(n) } else { None }).unwrap_or(0) as usize;
+                    let f = match num {
+                        Value::Int(n) => n as f64,
+                        Value::Float(f) => f,
+                        Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+                        _ => return Value::Null,
+                    };
+                    let factor = 10f64.powi(decimals as i32);
+                    let rounded = (f * factor).round() / factor;
+                    let int_part = rounded.abs() as i64;
+                    let frac = (rounded.abs() * factor).round() as i64 % factor as i64;
+                    let int_str = int_part.to_string();
+                    let mut chunks: Vec<&str> = vec![];
+                    let len = int_str.len();
+                    let start = len % 3;
+                    if start > 0 { chunks.push(&int_str[..start]); }
+                    let mut i = start;
+                    while i < len { chunks.push(&int_str[i..i+3]); i += 3; }
+                    let formatted = chunks.join(",");
+                    let sign = if f < 0.0 { "-" } else { "" };
+                    if decimals > 0 {
+                        Value::Text(format!("{}{}.{:0>width$}", sign, formatted, frac, width=decimals))
+                    } else {
+                        Value::Text(format!("{}{}", sign, formatted))
+                    }
+                }
+                "TRUNCATE" => {
+                    let mut it = args.into_iter();
+                    let num = it.next().unwrap_or(Value::Null);
+                    let decimals = it.next().and_then(|v| if let Value::Int(n) = v { Some(n) } else { None }).unwrap_or(0);
+                    let f = match num {
+                        Value::Int(n) => if decimals >= 0 { return Value::Int(n); } else { n as f64 },
+                        Value::Float(f) => f,
+                        Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+                        _ => return Value::Null,
+                    };
+                    if decimals >= 0 {
+                        let factor = 10f64.powi(decimals as i32);
+                        let truncated = (f * factor).trunc() / factor;
+                        if decimals == 0 { Value::Int(truncated as i64) } else { Value::Float(truncated) }
+                    } else {
+                        let factor = 10f64.powi((-decimals) as i32);
+                        Value::Int(((f / factor).trunc() * factor) as i64)
+                    }
+                }
+                "POW" | "POWER" => {
+                    let mut it = args.into_iter();
+                    let base = it.next().unwrap_or(Value::Null);
+                    let exp = it.next().unwrap_or(Value::Null);
+                    let b = match &base { Value::Int(n) => *n as f64, Value::Float(f) => *f, _ => return Value::Null };
+                    let e = match &exp { Value::Int(n) => *n as f64, Value::Float(f) => *f, _ => return Value::Null };
+                    let r = b.powf(e);
+                    if r.fract() == 0.0 && r.abs() < 1e15 { Value::Int(r as i64) } else { Value::Float(r) }
+                }
+                "SQRT" => {
+                    let v = args.into_iter().next().unwrap_or(Value::Null);
+                    let f = match v { Value::Int(n) => n as f64, Value::Float(f) => f, _ => return Value::Null };
+                    Value::Float(f.sqrt())
+                }
+                "MOD" => {
+                    let mut it = args.into_iter();
+                    let a = it.next().unwrap_or(Value::Null);
+                    let b = it.next().unwrap_or(Value::Null);
+                    match (a, b) {
+                        (Value::Int(x), Value::Int(y)) if y != 0 => Value::Int(x % y),
+                        _ => Value::Null,
+                    }
+                }
+                "SIGN" => {
+                    let v = args.into_iter().next().unwrap_or(Value::Null);
+                    match v {
+                        Value::Int(n) => Value::Int(n.signum()),
+                        Value::Float(f) => Value::Int(if f > 0.0 { 1 } else if f < 0.0 { -1 } else { 0 }),
+                        _ => Value::Null,
+                    }
+                }
                 "IF" => {
                     let mut it = args.into_iter();
                     let cond = it.next().unwrap_or(Value::Null);
@@ -2524,6 +2701,125 @@ fn days_to_ymd(days: u64) -> (u64, u64, u64) {
     let mut mo = 1u64;
     for &md in &mdays { if rem < md { break; } rem -= md; mo += 1; }
     (y, mo, rem + 1)
+}
+
+fn ymd_to_days(y: i64, m: i64, d: i64) -> i64 {
+    let mut days = 0i64;
+    let base = if y >= 1970 {
+        let mut yr = 1970i64;
+        while yr < y { let leap = (yr%4==0&&yr%100!=0)||yr%400==0; days += if leap {366} else {365}; yr += 1; }
+        days
+    } else {
+        let mut yr = y;
+        while yr < 1970 { let leap = (yr%4==0&&yr%100!=0)||yr%400==0; days -= if leap {366} else {365}; yr += 1; }
+        days
+    };
+    let _ = base;
+    let leap = (y%4==0&&y%100!=0)||y%400==0;
+    let mdays = [31i64, if leap {29} else {28}, 31,30,31,30,31,31,30,31,30,31];
+    for i in 0..(m-1) as usize { days += mdays.get(i).copied().unwrap_or(30); }
+    days + d - 1
+}
+
+fn parse_date_str(s: &str) -> Option<i64> {
+    let s = s.trim();
+    // Formats: YYYY-MM-DD or YYYY-MM-DD HH:MM:SS
+    let date_part = s.split_whitespace().next()?;
+    let parts: Vec<&str> = date_part.splitn(3, '-').collect();
+    if parts.len() < 3 { return None; }
+    let y: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let d: i64 = parts[2].parse().ok()?;
+    Some(ymd_to_days(y, m, d))
+}
+
+fn format_date_ymd(y: i64, m: i64, d: i64) -> String {
+    format!("{:04}-{:02}-{:02}", y, m, d)
+}
+
+fn date_add_days(date_str: &str, delta_days: i64) -> Option<String> {
+    let base = parse_date_str(date_str)?;
+    let new_days = base + delta_days;
+    let (y, mo, d) = if new_days >= 0 {
+        days_to_ymd(new_days as u64)
+    } else {
+        // For negative days, convert back carefully
+        let pos = (-new_days - 1) as u64;
+        let (y, mo, d) = days_to_ymd(pos);
+        let (y, mo, d) = (y as i64, mo as i64, d as i64);
+        return Some(format_date_ymd(1970 - y, 13 - mo, d));
+    };
+    Some(format_date_ymd(y as i64, mo as i64, d as i64))
+}
+
+fn add_months(date_str: &str, months: i64) -> Option<String> {
+    let s = date_str.trim();
+    let date_part = s.split_whitespace().next()?;
+    let parts: Vec<&str> = date_part.splitn(3, '-').collect();
+    if parts.len() < 3 { return None; }
+    let y: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let d: i64 = parts[2].parse().ok()?;
+    let total_months = y * 12 + (m - 1) + months;
+    let ny = total_months / 12;
+    let nm = total_months % 12 + 1;
+    let leap = (ny%4==0&&ny%100!=0)||ny%400==0;
+    let mdays = [31i64, if leap {29} else {28}, 31,30,31,30,31,31,30,31,30,31];
+    let max_d = mdays.get((nm-1) as usize).copied().unwrap_or(30);
+    let nd = d.min(max_d);
+    Some(format_date_ymd(ny, nm, nd))
+}
+
+fn mysql_date_format(date_str: &str, fmt: &str) -> String {
+    // Parse date/datetime
+    let s = date_str.trim();
+    let parts: Vec<&str> = s.splitn(2, ' ').collect();
+    let date = parts.get(0).copied().unwrap_or("");
+    let time = parts.get(1).copied().unwrap_or("00:00:00");
+    let dp: Vec<i64> = date.splitn(3, '-').filter_map(|p| p.parse().ok()).collect();
+    let tp: Vec<i64> = time.splitn(3, ':').filter_map(|p| p.split('.').next().and_then(|x| x.parse().ok())).collect();
+    let (y, m, d) = (dp.get(0).copied().unwrap_or(0), dp.get(1).copied().unwrap_or(0), dp.get(2).copied().unwrap_or(0));
+    let (h, mi, sec) = (tp.get(0).copied().unwrap_or(0), tp.get(1).copied().unwrap_or(0), tp.get(2).copied().unwrap_or(0));
+    let weekday_names = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+    let month_names = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+    let mut result = String::new();
+    let mut chars = fmt.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' { result.push(c); continue; }
+        match chars.next() {
+            Some('Y') => result.push_str(&format!("{:04}", y)),
+            Some('y') => result.push_str(&format!("{:02}", y % 100)),
+            Some('m') => result.push_str(&format!("{:02}", m)),
+            Some('c') => result.push_str(&m.to_string()),
+            Some('d') => result.push_str(&format!("{:02}", d)),
+            Some('e') => result.push_str(&d.to_string()),
+            Some('H') => result.push_str(&format!("{:02}", h)),
+            Some('h') | Some('I') => result.push_str(&format!("{:02}", if h%12==0 {12} else {h%12})),
+            Some('i') => result.push_str(&format!("{:02}", mi)),
+            Some('s') | Some('S') => result.push_str(&format!("{:02}", sec)),
+            Some('p') => result.push_str(if h < 12 { "AM" } else { "PM" }),
+            Some('M') => if m > 0 && m <= 12 { result.push_str(month_names[(m-1) as usize]); },
+            Some('b') => if m > 0 && m <= 12 { result.push_str(&month_names[(m-1) as usize][..3]); },
+            Some('j') => { // Day of year
+                let days = (1..m).map(|mo| [31i64,28,31,30,31,30,31,31,30,31,30,31][(mo-1) as usize]).sum::<i64>() + d;
+                result.push_str(&format!("{:03}", days));
+            }
+            Some('W') => { // Weekday name - simplified
+                let total_days = parse_date_str(date).unwrap_or(0);
+                let dow = ((total_days % 7 + 4) % 7 + 7) % 7; // 0=Sunday
+                result.push_str(weekday_names[dow as usize]);
+            }
+            Some('a') => {
+                let total_days = parse_date_str(date).unwrap_or(0);
+                let dow = ((total_days % 7 + 4) % 7 + 7) % 7;
+                result.push_str(&weekday_names[dow as usize][..3]);
+            }
+            Some('%') => result.push('%'),
+            Some(other) => { result.push('%'); result.push(other); }
+            None => result.push('%'),
+        }
+    }
+    result
 }
 
 fn values_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
