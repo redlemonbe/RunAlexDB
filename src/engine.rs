@@ -2187,6 +2187,63 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
         Expr::BinaryOp { left, op, right } => {
             use BinaryOperator::*;
             match op {
+                MyIntegerDivide => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    match (l, r) {
+                        (Value::Int(a), Value::Int(b)) if b != 0 => Value::Int(a / b),
+                        (Value::Float(a), Value::Int(b)) if b != 0 => Value::Int(a as i64 / b),
+                        (Value::Int(a), Value::Float(b)) if b != 0.0 => Value::Int(a / b as i64),
+                        _ => Value::Null,
+                    }
+                }
+                BitwiseOr => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => Value::Int(a | b),
+                        _ => Value::Null,
+                    }
+                }
+                BitwiseAnd => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => Value::Int(a & b),
+                        _ => Value::Null,
+                    }
+                }
+                BitwiseXor => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => Value::Int(a ^ b),
+                        _ => Value::Null,
+                    }
+                }
+                ShiftLeft => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    match (l, r) {
+                        (Value::Int(a), Value::Int(b)) if b >= 0 && b < 64 => Value::Int(a << b),
+                        _ => Value::Null,
+                    }
+                }
+                ShiftRight => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    match (l, r) {
+                        (Value::Int(a), Value::Int(b)) if b >= 0 && b < 64 => Value::Int(a >> b),
+                        _ => Value::Null,
+                    }
+                }
+                StringConcat => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    let ls = l.into_text().unwrap_or_default();
+                    let rs = r.into_text().unwrap_or_default();
+                    Value::Text(ls + &rs)
+                }
                 Plus | Minus | Multiply | Divide | Modulo => {
                     let l = eval_row_expr(row, cols, left);
                     let r = eval_row_expr(row, cols, right);
@@ -2232,6 +2289,43 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                 _ => Value::Null,
             }
         }
+        Expr::Convert { expr: inner, data_type, .. } => {
+            let v = eval_row_expr(row, cols, inner);
+            if let Some(dt) = data_type {
+                use sqlparser::ast::DataType;
+                match dt {
+                    DataType::Int(_) | DataType::Integer(_) | DataType::SmallInt(_) | DataType::TinyInt(_) | DataType::BigInt(_) | DataType::Signed | DataType::SignedInteger => match v {
+                        Value::Int(i) => Value::Int(i),
+                        Value::Float(f) => Value::Int(f as i64),
+                        Value::Text(s) => s.trim().parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    },
+                    DataType::Unsigned | DataType::UnsignedInteger => match v {
+                        Value::Int(i) => Value::Int(i.abs()),
+                        Value::Float(f) => Value::Int(f.abs() as i64),
+                        Value::Text(s) => s.trim().parse::<i64>().map(|n| Value::Int(n.abs())).unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    },
+                    DataType::Varchar(_) | DataType::Text | DataType::Char(_) | DataType::String(_) => match v {
+                        Value::Text(s) => Value::Text(s),
+                        Value::Int(i) => Value::Text(i.to_string()),
+                        Value::Float(f) => Value::Text(f.to_string()),
+                        _ => Value::Null,
+                    },
+                    DataType::Float(_) | DataType::Real | DataType::Double(_) | DataType::DoublePrecision => match v {
+                        Value::Float(f) => Value::Float(f),
+                        Value::Int(i) => Value::Float(i as f64),
+                        Value::Text(s) => s.trim().parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    },
+                    DataType::Date => match v {
+                        Value::Text(s) => Value::Text(s.split_whitespace().next().unwrap_or("").to_owned()),
+                        _ => Value::Null,
+                    },
+                    _ => v,
+                }
+            } else { v }
+        }
         Expr::Cast { expr: inner, data_type, .. } => {
             let v = eval_row_expr(row, cols, inner);
             use sqlparser::ast::DataType;
@@ -2242,10 +2336,41 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                     Value::Text(s) => s.trim().parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
                     _ => Value::Null,
                 },
-                DataType::Varchar(_) | DataType::Text | DataType::Char(_) => match v {
+                DataType::Varchar(_) | DataType::Text | DataType::Char(_) | DataType::String(_) => match v {
                     Value::Text(s) => Value::Text(s),
                     Value::Int(i) => Value::Text(i.to_string()),
                     Value::Float(f) => Value::Text(f.to_string()),
+                    _ => Value::Null,
+                },
+                DataType::Unsigned | DataType::UnsignedInteger => match v {
+                    Value::Int(i) => Value::Int(i.abs()),
+                    Value::Float(f) => Value::Int(f.abs() as i64),
+                    Value::Text(s) => s.trim().parse::<i64>().map(|n| Value::Int(n.abs())).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
+                DataType::Signed | DataType::SignedInteger => match v {
+                    Value::Int(i) => Value::Int(i),
+                    Value::Float(f) => Value::Int(f as i64),
+                    Value::Text(s) => s.trim().parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
+                DataType::Date => match v {
+                    Value::Text(s) => Value::Text(s.split_whitespace().next().unwrap_or("").to_owned()),
+                    _ => Value::Null,
+                },
+                DataType::Datetime(_) | DataType::Timestamp(_, _) => match v {
+                    Value::Text(s) => Value::Text(s),
+                    Value::Int(n) => {
+                        let (y, m, d) = days_to_ymd(n as u64 / 86400);
+                        let h = (n / 3600) % 24; let mi = (n / 60) % 60; let s = n % 60;
+                        Value::Text(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, m, d, h, mi, s))
+                    }
+                    _ => Value::Null,
+                },
+                DataType::Boolean => match v {
+                    Value::Int(0) => Value::Int(0),
+                    Value::Int(_) => Value::Int(1),
+                    Value::Text(s) => Value::Int(if s.eq_ignore_ascii_case("true") || s == "1" { 1 } else { 0 }),
                     _ => Value::Null,
                 },
                 DataType::Float(_) | DataType::Real | DataType::Double(_) | DataType::DoublePrecision => match v {
@@ -2668,6 +2793,43 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                 }
                 _ => Value::Null,
             }
+        }
+        Expr::InList { expr, list, negated } => {
+            let v = eval_row_expr(row, cols, expr);
+            let found = list.iter().any(|item| values_eq(&v, &eval_row_expr(row, cols, item)));
+            Value::Int(if *negated { !found } else { found } as i64)
+        }
+        Expr::IsNull(e) => {
+            Value::Int(matches!(eval_row_expr(row, cols, e), Value::Null) as i64)
+        }
+        Expr::IsNotNull(e) => {
+            Value::Int(!matches!(eval_row_expr(row, cols, e), Value::Null) as i64)
+        }
+        Expr::Between { expr, low, high, negated } => {
+            let v = eval_row_expr(row, cols, expr);
+            let lo = eval_row_expr(row, cols, low);
+            let hi = eval_row_expr(row, cols, high);
+            let in_range = values_cmp(&v, &lo) != std::cmp::Ordering::Less
+                && values_cmp(&v, &hi) != std::cmp::Ordering::Greater;
+            Value::Int(if *negated { !in_range } else { in_range } as i64)
+        }
+        Expr::Like { expr, pattern, negated, .. } => {
+            let v = eval_row_expr(row, cols, expr);
+            let p = eval_row_expr(row, cols, pattern);
+            let matched = match (v.into_text(), p.into_text()) {
+                (Some(vs), Some(ps)) => like_match(&vs, &ps),
+                _ => false,
+            };
+            Value::Int(if *negated { !matched } else { matched } as i64)
+        }
+        Expr::ILike { expr, pattern, negated, .. } => {
+            let v = eval_row_expr(row, cols, expr);
+            let p = eval_row_expr(row, cols, pattern);
+            let matched = match (v.into_text(), p.into_text()) {
+                (Some(vs), Some(ps)) => like_match(&vs.to_lowercase(), &ps.to_lowercase()),
+                _ => false,
+            };
+            Value::Int(if *negated { !matched } else { matched } as i64)
         }
         Expr::Case { operand, conditions, else_result } => {
             let base = operand.as_ref().map(|e| eval_row_expr(row, cols, e));
