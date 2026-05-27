@@ -68,6 +68,23 @@ impl Value {
             Value::Bytes(b) => Some(hex::encode(b)),
         }
     }
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            Value::Text(s) => Some(s),
+            Value::Int(i) => Some(i.to_string()),
+            Value::Float(f) => Some(f.to_string()),
+            Value::Null => None,
+            _ => None,
+        }
+    }
+    pub fn into_int(self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(i),
+            Value::Float(f) => Some(f as i64),
+            Value::Text(s) => s.trim().parse::<i64>().ok(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1040,6 +1057,83 @@ impl Engine {
             return QueryResult::rows(out_cols, out_rows);
         }
 
+        // ── Expression projection fast-check ────────────────────────────────
+        // If any item is not a plain col-ref, evaluate all items via eval_row_expr.
+        let is_plain_col = |p: &SelectItem| matches!(
+            p,
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)
+            | SelectItem::UnnamedExpr(Expr::Identifier(_))
+            | SelectItem::UnnamedExpr(Expr::CompoundIdentifier(_))
+            | SelectItem::ExprWithAlias { expr: Expr::Identifier(_), .. }
+            | SelectItem::ExprWithAlias { expr: Expr::CompoundIdentifier(_), .. }
+        );
+        let has_expr_projection = !sel.projection.iter().all(is_plain_col);
+        if has_expr_projection {
+            // Build list of (output_name, expr_to_evaluate) — wildcards expand to all columns
+            let expr_proj: Vec<(String, Expr)> = if sel.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))) {
+                table.columns.iter().map(|c| (c.name.clone(), Expr::Identifier(sqlparser::ast::Ident::new(c.name.clone())))).collect()
+            } else {
+                sel.projection.iter().map(|p| match p {
+                    SelectItem::UnnamedExpr(expr) => {
+                        let name = match expr {
+                            Expr::Identifier(id) => id.value.clone(),
+                            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()).unwrap_or_else(|| expr.to_string()),
+                            _ => expr.to_string(),
+                        };
+                        (name, expr.clone())
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr.clone()),
+                    _ => ("?".to_owned(), Expr::Identifier(sqlparser::ast::Ident::new("__null__"))),
+                }).collect()
+            };
+            let col_names: Vec<String> = expr_proj.iter().map(|(n, _)| n.clone()).collect();
+            let mut result_rows: Vec<Vec<Option<String>>> = table.rows.iter()
+                .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &table.columns, w)))
+                .map(|row| {
+                    expr_proj.iter().map(|(_, e)| eval_row_expr(row, &table.columns, e).to_display()).collect()
+                })
+                .collect();
+            // ORDER BY
+            if let Some(ob) = &query.order_by {
+                if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+                    for order_expr in exprs.iter().rev() {
+                        let col_name = order_expr.expr.to_string();
+                        if let Some(pidx) = col_names.iter().position(|n| n.eq_ignore_ascii_case(&col_name)) {
+                            let asc = order_expr.options.asc.unwrap_or(true);
+                            result_rows.sort_by(|a, b| {
+                                let av = a.get(pidx).and_then(|x| x.as_deref());
+                                let bv = b.get(pidx).and_then(|x| x.as_deref());
+                                let ord = match (av, bv) {
+                                    (Some(x), Some(y)) => match (x.parse::<i64>(), y.parse::<i64>()) {
+                                        (Ok(xi), Ok(yi)) => xi.cmp(&yi), _ => x.cmp(y),
+                                    },
+                                    (None, Some(_)) => std::cmp::Ordering::Less,
+                                    (Some(_), None) => std::cmp::Ordering::Greater,
+                                    (None, None) => std::cmp::Ordering::Equal,
+                                };
+                                if asc { ord } else { ord.reverse() }
+                            });
+                        }
+                    }
+                }
+            }
+            let offset = query.offset.as_ref().and_then(|o| {
+                if let Expr::Value(vs) = &o.value {
+                    if let sqlparser::ast::Value::Number(n, _) = &vs.value { n.parse::<usize>().ok() }
+                    else { None }
+                } else { None }
+            }).unwrap_or(0);
+            if offset > 0 { result_rows = result_rows.into_iter().skip(offset).collect(); }
+            if let Some(lim) = &query.limit {
+                if let Expr::Value(vs) = lim {
+                    if let sqlparser::ast::Value::Number(n, _) = &vs.value {
+                        if let Ok(n) = n.parse::<usize>() { result_rows.truncate(n); }
+                    }
+                }
+            }
+            return QueryResult::rows(col_names, result_rows);
+        }
+
         // Column projection
         let proj_cols: Vec<(String, usize)> = if sel.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..))) {
             table.columns.iter().enumerate().map(|(i, c)| (c.name.clone(), i)).collect()
@@ -1416,8 +1510,336 @@ fn eval_row_expr(row: &Row, cols: &[Column], expr: &Expr) -> Value {
                     .unwrap_or(Value::Null)
             } else { Value::Null }
         }
+        Expr::Nested(inner) => eval_row_expr(row, cols, inner),
+        Expr::UnaryOp { op, expr: inner } => {
+            let v = eval_row_expr(row, cols, inner);
+            match op {
+                UnaryOperator::Minus => match v {
+                    Value::Int(i) => Value::Int(-i),
+                    Value::Float(f) => Value::Float(-f),
+                    _ => Value::Null,
+                },
+                UnaryOperator::Plus => v,
+                _ => Value::Null,
+            }
+        }
+        Expr::BinaryOp { left, op, right } => {
+            use BinaryOperator::*;
+            match op {
+                Plus | Minus | Multiply | Divide | Modulo => {
+                    let l = eval_row_expr(row, cols, left);
+                    let r = eval_row_expr(row, cols, right);
+                    match (l, r) {
+                        (Value::Int(a), Value::Int(b)) => match op {
+                            Plus     => Value::Int(a.wrapping_add(b)),
+                            Minus    => Value::Int(a.wrapping_sub(b)),
+                            Multiply => Value::Int(a.wrapping_mul(b)),
+                            Divide   => if b != 0 { Value::Int(a / b) } else { Value::Null },
+                            Modulo   => if b != 0 { Value::Int(a % b) } else { Value::Null },
+                            _ => unreachable!(),
+                        },
+                        (Value::Float(a), Value::Float(b)) => match op {
+                            Plus     => Value::Float(a + b),
+                            Minus    => Value::Float(a - b),
+                            Multiply => Value::Float(a * b),
+                            Divide   => if b != 0.0 { Value::Float(a / b) } else { Value::Null },
+                            Modulo   => Value::Float(a % b),
+                            _ => unreachable!(),
+                        },
+                        (Value::Int(a), Value::Float(b)) => {
+                            let a = a as f64;
+                            match op {
+                                Plus  => Value::Float(a + b), Minus => Value::Float(a - b),
+                                Multiply => Value::Float(a * b),
+                                Divide => if b != 0.0 { Value::Float(a / b) } else { Value::Null },
+                                Modulo => Value::Float(a % b), _ => unreachable!(),
+                            }
+                        },
+                        (Value::Float(a), Value::Int(b)) => {
+                            let b = b as f64;
+                            match op {
+                                Plus  => Value::Float(a + b), Minus => Value::Float(a - b),
+                                Multiply => Value::Float(a * b),
+                                Divide => if b != 0.0 { Value::Float(a / b) } else { Value::Null },
+                                Modulo => Value::Float(a % b), _ => unreachable!(),
+                            }
+                        },
+                        (Value::Text(a), Value::Text(b)) if matches!(op, Plus) => Value::Text(a + &b),
+                        _ => Value::Null,
+                    }
+                }
+                _ => Value::Null,
+            }
+        }
+        Expr::Cast { expr: inner, data_type, .. } => {
+            let v = eval_row_expr(row, cols, inner);
+            use sqlparser::ast::DataType;
+            match data_type {
+                DataType::Int(_) | DataType::Integer(_) | DataType::SmallInt(_) | DataType::TinyInt(_) | DataType::BigInt(_) => match v {
+                    Value::Int(i) => Value::Int(i),
+                    Value::Float(f) => Value::Int(f as i64),
+                    Value::Text(s) => s.trim().parse::<i64>().map(Value::Int).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
+                DataType::Varchar(_) | DataType::Text | DataType::Char(_) => match v {
+                    Value::Text(s) => Value::Text(s),
+                    Value::Int(i) => Value::Text(i.to_string()),
+                    Value::Float(f) => Value::Text(f.to_string()),
+                    _ => Value::Null,
+                },
+                DataType::Float(_) | DataType::Real | DataType::Double(_) | DataType::DoublePrecision => match v {
+                    Value::Float(f) => Value::Float(f),
+                    Value::Int(i) => Value::Float(i as f64),
+                    Value::Text(s) => s.trim().parse::<f64>().map(Value::Float).unwrap_or(Value::Null),
+                    _ => Value::Null,
+                },
+                _ => v,
+            }
+        }
+        Expr::Function(f) => {
+            let fname = f.name.to_string().to_uppercase();
+            let args: Vec<Value> = match &f.args {
+                sqlparser::ast::FunctionArguments::List(list) => {
+                    list.args.iter().map(|a| match a {
+                        sqlparser::ast::FunctionArg::Unnamed(fae)
+                        | sqlparser::ast::FunctionArg::Named { arg: fae, .. }
+                        | sqlparser::ast::FunctionArg::ExprNamed { arg: fae, .. } => match fae {
+                            sqlparser::ast::FunctionArgExpr::Expr(e) => eval_row_expr(row, cols, e),
+                            _ => Value::Null,
+                        },
+                    }).collect()
+                }
+                _ => vec![],
+            };
+            match fname.as_str() {
+                "UPPER" => args.into_iter().next().and_then(|v| v.into_text()).map(|s| Value::Text(s.to_uppercase())).unwrap_or(Value::Null),
+                "LOWER" => args.into_iter().next().and_then(|v| v.into_text()).map(|s| Value::Text(s.to_lowercase())).unwrap_or(Value::Null),
+                "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" => args.into_iter().next().and_then(|v| v.into_text()).map(|s| Value::Int(s.chars().count() as i64)).unwrap_or(Value::Null),
+                "TRIM" => args.into_iter().next().and_then(|v| v.into_text()).map(|s| Value::Text(s.trim().to_owned())).unwrap_or(Value::Null),
+                "LTRIM" => args.into_iter().next().and_then(|v| v.into_text()).map(|s| Value::Text(s.trim_start().to_owned())).unwrap_or(Value::Null),
+                "RTRIM" => args.into_iter().next().and_then(|v| v.into_text()).map(|s| Value::Text(s.trim_end().to_owned())).unwrap_or(Value::Null),
+                "REVERSE" => args.into_iter().next().and_then(|v| v.into_text()).map(|s| Value::Text(s.chars().rev().collect())).unwrap_or(Value::Null),
+                "HEX" => args.into_iter().next().map(|v| match v {
+                    Value::Int(i) => Value::Text(format!("{:X}", i)),
+                    Value::Text(s) => Value::Text(s.bytes().map(|b| format!("{:02X}", b)).collect::<String>()),
+                    _ => Value::Null,
+                }).unwrap_or(Value::Null),
+                "CONCAT" => {
+                    let parts: Vec<String> = args.into_iter().filter_map(|v| v.into_text()).collect();
+                    Value::Text(parts.join(""))
+                }
+                "CONCAT_WS" => {
+                    let mut it = args.into_iter();
+                    let sep = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let parts: Vec<String> = it.filter_map(|v| v.into_text()).collect();
+                    Value::Text(parts.join(&sep))
+                }
+                "LEFT" => {
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let n = it.next().and_then(|v| v.into_int()).unwrap_or(0).max(0) as usize;
+                    Value::Text(s.chars().take(n).collect())
+                }
+                "RIGHT" => {
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let n = it.next().and_then(|v| v.into_int()).unwrap_or(0).max(0) as usize;
+                    let ch: Vec<char> = s.chars().collect();
+                    Value::Text(ch[ch.len().saturating_sub(n)..].iter().collect())
+                }
+                "SUBSTRING" | "SUBSTR" | "MID" => {
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let start = it.next().and_then(|v| v.into_int()).unwrap_or(1).max(1) as usize - 1;
+                    let len_opt = it.next().and_then(|v| v.into_int()).map(|n| n.max(0) as usize);
+                    let chars: Vec<char> = s.chars().collect();
+                    let slice = &chars[start.min(chars.len())..];
+                    let result: String = match len_opt {
+                        Some(n) => slice.iter().take(n).collect(),
+                        None => slice.iter().collect(),
+                    };
+                    Value::Text(result)
+                }
+                "REPLACE" => {
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let from = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let to = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    Value::Text(s.replace(from.as_str(), to.as_str()))
+                }
+                "REPEAT" => {
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let n = it.next().and_then(|v| v.into_int()).unwrap_or(0).max(0) as usize;
+                    Value::Text(s.repeat(n))
+                }
+                "LPAD" => {
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let len = it.next().and_then(|v| v.into_int()).unwrap_or(0).max(0) as usize;
+                    let pad = it.next().and_then(|v| v.into_text()).unwrap_or_else(|| " ".to_owned());
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= len { return Value::Text(chars.into_iter().collect()); }
+                    let needed = len - chars.len();
+                    let pad_chars: Vec<char> = pad.chars().collect();
+                    if pad_chars.is_empty() { return Value::Text(s); }
+                    let prefix: String = pad_chars.iter().cycle().take(needed).collect();
+                    Value::Text(prefix + &s)
+                }
+                "RPAD" => {
+                    let mut it = args.into_iter();
+                    let s = it.next().and_then(|v| v.into_text()).unwrap_or_default();
+                    let len = it.next().and_then(|v| v.into_int()).unwrap_or(0).max(0) as usize;
+                    let pad = it.next().and_then(|v| v.into_text()).unwrap_or_else(|| " ".to_owned());
+                    let chars: Vec<char> = s.chars().collect();
+                    if chars.len() >= len { return Value::Text(s); }
+                    let needed = len - chars.len();
+                    let pad_chars: Vec<char> = pad.chars().collect();
+                    if pad_chars.is_empty() { return Value::Text(s); }
+                    let suffix: String = pad_chars.iter().cycle().take(needed).collect();
+                    Value::Text(s + &suffix)
+                }
+                "ABS" => args.into_iter().next().map(|v| match v {
+                    Value::Int(i) => Value::Int(i.abs()),
+                    Value::Float(f) => Value::Float(f.abs()),
+                    _ => Value::Null,
+                }).unwrap_or(Value::Null),
+                "CEIL" | "CEILING" => args.into_iter().next().map(|v| match v {
+                    Value::Float(f) => Value::Int(f.ceil() as i64),
+                    Value::Int(i) => Value::Int(i),
+                    _ => Value::Null,
+                }).unwrap_or(Value::Null),
+                "FLOOR" => args.into_iter().next().map(|v| match v {
+                    Value::Float(f) => Value::Int(f.floor() as i64),
+                    Value::Int(i) => Value::Int(i),
+                    _ => Value::Null,
+                }).unwrap_or(Value::Null),
+                "ROUND" => {
+                    let mut it = args.into_iter();
+                    let v = it.next().unwrap_or(Value::Null);
+                    let dec = it.next().and_then(|v| v.into_int()).unwrap_or(0);
+                    match v {
+                        Value::Float(f) => { let m = 10f64.powi(dec as i32); Value::Float((f * m).round() / m) }
+                        Value::Int(i) => Value::Int(i),
+                        _ => Value::Null,
+                    }
+                }
+                "MOD" => {
+                    let mut it = args.into_iter();
+                    match (it.next().unwrap_or(Value::Null), it.next().unwrap_or(Value::Null)) {
+                        (Value::Int(a), Value::Int(b)) if b != 0 => Value::Int(a % b),
+                        (Value::Float(a), Value::Float(b)) if b != 0.0 => Value::Float(a % b),
+                        _ => Value::Null,
+                    }
+                }
+                "POW" | "POWER" => {
+                    let mut it = args.into_iter();
+                    match (it.next().unwrap_or(Value::Null), it.next().unwrap_or(Value::Null)) {
+                        (Value::Int(b), Value::Int(e)) if e >= 0 => Value::Int(b.pow(e as u32)),
+                        (Value::Float(b), Value::Float(e)) => Value::Float(b.powf(e)),
+                        (Value::Int(b), Value::Float(e)) => Value::Float((b as f64).powf(e)),
+                        (Value::Float(b), Value::Int(e)) => Value::Float(b.powi(e as i32)),
+                        _ => Value::Null,
+                    }
+                }
+                "SQRT" => args.into_iter().next().map(|v| match v {
+                    Value::Float(f) => Value::Float(f.sqrt()),
+                    Value::Int(i) => Value::Float((i as f64).sqrt()),
+                    _ => Value::Null,
+                }).unwrap_or(Value::Null),
+                "NOW" | "CURRENT_TIMESTAMP" | "SYSDATE" => {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let s = ts % 60; let m = (ts / 60) % 60; let h = (ts / 3600) % 24;
+                    let (y, mo, d) = days_to_ymd(ts / 86400);
+                    Value::Text(format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", y, mo, d, h, m, s))
+                }
+                "CURDATE" | "CURRENT_DATE" => {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let (y, mo, d) = days_to_ymd(ts / 86400);
+                    Value::Text(format!("{:04}-{:02}-{:02}", y, mo, d))
+                }
+                "CURTIME" | "CURRENT_TIME" => {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    let s = ts % 60; let m = (ts / 60) % 60; let h = (ts / 3600) % 24;
+                    Value::Text(format!("{:02}:{:02}:{:02}", h, m, s))
+                }
+                "UNIX_TIMESTAMP" => {
+                    let ts = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                    Value::Int(ts as i64)
+                }
+                "YEAR" => args.into_iter().next().and_then(|v| v.into_text()).and_then(|s| {
+                    s.split('-').next().and_then(|y| y.parse::<i64>().ok()).map(Value::Int)
+                }).unwrap_or(Value::Null),
+                "MONTH" => args.into_iter().next().and_then(|v| v.into_text()).and_then(|s| {
+                    s.splitn(3, '-').nth(1).and_then(|m| m.parse::<i64>().ok()).map(Value::Int)
+                }).unwrap_or(Value::Null),
+                "DAY" | "DAYOFMONTH" => args.into_iter().next().and_then(|v| v.into_text()).and_then(|s| {
+                    s.splitn(4, '-').nth(2).and_then(|d| d.split(' ').next()).and_then(|d| d.parse::<i64>().ok()).map(Value::Int)
+                }).unwrap_or(Value::Null),
+                "IF" => {
+                    let mut it = args.into_iter();
+                    let cond = it.next().unwrap_or(Value::Null);
+                    let t = it.next().unwrap_or(Value::Null);
+                    let f_val = it.next().unwrap_or(Value::Null);
+                    let truthy = !matches!(&cond, Value::Int(0) | Value::Null);
+                    if truthy { t } else { f_val }
+                }
+                "IFNULL" | "NVL" => {
+                    let mut it = args.into_iter();
+                    let v = it.next().unwrap_or(Value::Null);
+                    let fallback = it.next().unwrap_or(Value::Null);
+                    if matches!(v, Value::Null) { fallback } else { v }
+                }
+                "NULLIF" => {
+                    let mut it = args.into_iter();
+                    let a = it.next().unwrap_or(Value::Null);
+                    let b = it.next().unwrap_or(Value::Null);
+                    if values_eq(&a, &b) { Value::Null } else { a }
+                }
+                "COALESCE" => args.into_iter().find(|v| !matches!(v, Value::Null)).unwrap_or(Value::Null),
+                "ISNULL" => {
+                    let v = args.into_iter().next().unwrap_or(Value::Null);
+                    Value::Int(if matches!(v, Value::Null) { 1 } else { 0 })
+                }
+                _ => Value::Null,
+            }
+        }
+        Expr::Case { operand, conditions, else_result } => {
+            let base = operand.as_ref().map(|e| eval_row_expr(row, cols, e));
+            for cw in conditions.iter() {
+                let matched = if let Some(ref b) = base {
+                    let cv = eval_row_expr(row, cols, &cw.condition);
+                    values_eq(b, &cv)
+                } else {
+                    eval_where(row, cols, &cw.condition)
+                };
+                if matched { return eval_row_expr(row, cols, &cw.result); }
+            }
+            else_result.as_ref().map(|e| eval_row_expr(row, cols, e)).unwrap_or(Value::Null)
+        }
         _ => Value::Null,
     }
+}
+
+/// Days since Unix epoch → (year, month, day).
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    let mut y = 1970u64;
+    let mut rem = days;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+        let yd = if leap { 366 } else { 365 };
+        if rem < yd { break; }
+        rem -= yd; y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let mdays = [31u64, if leap {29} else {28}, 31,30,31,30,31,31,30,31,30,31];
+    let mut mo = 1u64;
+    for &md in &mdays { if rem < md { break; } rem -= md; mo += 1; }
+    (y, mo, rem + 1)
 }
 
 fn values_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
