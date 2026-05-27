@@ -687,7 +687,83 @@ impl Engine {
             }
             Statement::CreateTable(create) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
-                self.create_table(db_name, create.name, create.columns, create.if_not_exists)
+                if let Some(src_query) = create.query {
+                    // CREATE TABLE ... AS SELECT
+                    let qr = self.select(db_name, *src_query);
+                    let (qcols, qrows) = match qr {
+                        QueryResult::Rows { columns, rows } => (columns, rows),
+                        QueryResult::ValueRows { columns, rows } => (columns, rows.into_iter().map(|r| r.into_iter().map(|v| v.to_display()).collect()).collect()),
+                        other => return other,
+                    };
+                    let parts: Vec<String> = create.name.0.iter()
+                        .map(|p| p.as_ident().map(|i| i.value.clone()).unwrap_or_default())
+                        .collect();
+                    let (tbl_db, tbl_name) = if parts.len() >= 2 {
+                        (parts[parts.len()-2].clone(), parts[parts.len()-1].clone())
+                    } else {
+                        (db_name.to_owned(), parts.last().cloned().unwrap_or_default())
+                    };
+                    let columns: Vec<Column> = if !create.columns.is_empty() {
+                        create.columns.iter().map(|c| {
+                            let col_type = sql_type_to_col_type(&c.data_type);
+                            let is_pk = c.options.iter().any(|o| matches!(&o.option, sqlparser::ast::ColumnOption::Unique { is_primary: true, .. }));
+                            Column { name: c.name.value.clone(), col_type, nullable: !is_pk, primary_key: is_pk }
+                        }).collect()
+                    } else {
+                        qcols.iter().enumerate().map(|(i, n)| {
+                            let col_type = if let Some(first) = qrows.first() {
+                                if let Some(Some(s)) = first.get(i) {
+                                    if s.parse::<i64>().is_ok() { ColumnType::BigInt }
+                                    else if s.parse::<f64>().is_ok() { ColumnType::Float }
+                                    else { ColumnType::VarChar(255) }
+                                } else { ColumnType::VarChar(255) }
+                            } else { ColumnType::VarChar(255) };
+                            Column { name: n.clone(), col_type, nullable: true, primary_key: false }
+                        }).collect()
+                    };
+                    let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+                    let Some(db_arc) = dbs.get(&tbl_db) else {
+                        return QueryResult::err(1049, &format!("Unknown database '{}'", tbl_db));
+                    };
+                    let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+                    if create.if_not_exists && db.tables.contains_key(&tbl_name) {
+                        return QueryResult::ok(0, 0);
+                    }
+                    let col_int_data: Vec<Option<Vec<i64>>> = columns.iter().map(|c| {
+                        match c.col_type { ColumnType::Int | ColumnType::BigInt => Some(Vec::new()), _ => None }
+                    }).collect();
+                    let col_str_data: Vec<Option<Vec<String>>> = columns.iter().map(|c| {
+                        match c.col_type { ColumnType::Text | ColumnType::VarChar(_) => Some(Vec::new()), _ => None }
+                    }).collect();
+                    let rows: Vec<Row> = qrows.into_iter().map(|qrow| {
+                        qrow.into_iter().enumerate().map(|(ci, v)| match v {
+                            Some(s) => if ci < columns.len() {
+                                match columns[ci].col_type {
+                                    ColumnType::Int | ColumnType::BigInt => s.parse::<i64>().map(Value::Int).unwrap_or(Value::Text(s)),
+                                    ColumnType::Float => s.parse::<f64>().map(Value::Float).unwrap_or(Value::Text(s)),
+                                    _ => Value::Text(s),
+                                }
+                            } else { Value::Text(s) },
+                            None => Value::Null,
+                        }).collect()
+                    }).collect();
+                    let pk_col_idx = columns.iter().position(|c| c.primary_key);
+                    db.tables.insert(tbl_name.clone(), Table {
+                        name: tbl_name,
+                        schema: tbl_db,
+                        columns,
+                        rows,
+                        pk_col_idx,
+                        pk_index: HashMap::new(),
+                        col_int_data,
+                        col_str_data,
+                        next_auto: 1,
+                    });
+                    self.bump_write_gen();
+                    QueryResult::ok(0, 0)
+                } else {
+                    self.create_table(db_name, create.name, create.columns, create.if_not_exists)
+                }
             }
             Statement::Insert(insert) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
@@ -1430,6 +1506,138 @@ impl Engine {
             .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &combined_cols, w)))
             .collect();
 
+        // ── GROUP BY path for joined queries ──────────────────────────────
+        if let sqlparser::ast::GroupByExpr::Expressions(gb_exprs, _) = &sel.group_by {
+            if !gb_exprs.is_empty() {
+                let gb_col_indices: Vec<usize> = gb_exprs.iter().filter_map(|e| {
+                    let name = match e {
+                        Expr::Identifier(id) => id.value.clone(),
+                        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()).unwrap_or_default(),
+                        _ => return None,
+                    };
+                    combined_cols.iter().position(|c| {
+                        c.name.eq_ignore_ascii_case(&name)
+                        || c.name.rsplit('.').next().map_or(false, |n| n.eq_ignore_ascii_case(&name))
+                    })
+                }).collect();
+                let mut groups: std::collections::BTreeMap<Vec<Option<String>>, Vec<Row>> = std::collections::BTreeMap::new();
+                for row in filtered {
+                    let key: Vec<Option<String>> = gb_col_indices.iter()
+                        .map(|&ci| row.get(ci).and_then(|v| v.to_display()))
+                        .collect();
+                    groups.entry(key).or_default().push(row);
+                }
+                let is_agg = |name: &str| matches!(name, "COUNT"|"SUM"|"AVG"|"MIN"|"MAX"|"GROUP_CONCAT");
+                let eval_agg = |f: &sqlparser::ast::Function, rows: &[Row]| -> Option<String> {
+                    let fname = f.name.to_string().to_uppercase();
+                    let get_col_expr = || -> Option<Expr> {
+                        if let sqlparser::ast::FunctionArguments::List(ref list) = f.args {
+                            list.args.first().and_then(|a| match a {
+                                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => Some(e.clone()),
+                                _ => None,
+                            })
+                        } else { None }
+                    };
+                    if fname == "COUNT" {
+                        if let sqlparser::ast::FunctionArguments::List(ref list) = f.args {
+                            let is_star = matches!(list.args.first(),
+                                Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard)));
+                            if is_star { return Some(rows.len().to_string()); }
+                            if let Some(e) = get_col_expr() {
+                                let cnt = rows.iter().filter(|r| !matches!(eval_row_expr(r, &combined_cols, &e), Value::Null)).count();
+                                return Some(cnt.to_string());
+                            }
+                        }
+                        return Some(rows.len().to_string());
+                    }
+                    let col_expr = get_col_expr()?;
+                    let nums: Vec<f64> = rows.iter().filter_map(|r| match eval_row_expr(r, &combined_cols, &col_expr) {
+                        Value::Int(n) => Some(n as f64),
+                        Value::Float(f) => Some(f),
+                        Value::Text(s) => s.parse().ok(),
+                        _ => None,
+                    }).collect();
+                    match fname.as_str() {
+                        "SUM" => { let s: f64 = nums.iter().sum(); Some(if s.fract() == 0.0 { format!("{:.0}", s) } else { format!("{:.2}", s) }) }
+                        "AVG" => { if nums.is_empty() { None } else { let a = nums.iter().sum::<f64>() / nums.len() as f64; Some(if a.fract() == 0.0 { format!("{:.0}", a) } else { format!("{}", a) }) } }
+                        "MIN" => nums.iter().cloned().reduce(f64::min).map(|v| if v.fract() == 0.0 { format!("{:.0}", v) } else { v.to_string() }),
+                        "MAX" => nums.iter().cloned().reduce(f64::max).map(|v| if v.fract() == 0.0 { format!("{:.0}", v) } else { v.to_string() }),
+                        "GROUP_CONCAT" => {
+                            let parts: Vec<String> = rows.iter().filter_map(|r| eval_row_expr(r, &combined_cols, &col_expr).to_display()).collect();
+                            if parts.is_empty() { None } else { Some(parts.join(",")) }
+                        }
+                        _ => None,
+                    }
+                };
+                let out_cols: Vec<String> = sel.projection.iter().map(|p| match p {
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::UnnamedExpr(e) => match e {
+                        Expr::Identifier(id) => id.value.clone(),
+                        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()).unwrap_or_else(|| e.to_string()),
+                        _ => e.to_string(),
+                    },
+                    other => other.to_string(),
+                }).collect();
+                let mut out_rows: Vec<Vec<Option<String>>> = groups.iter().map(|(group_key, rows)| {
+                    sel.projection.iter().map(|p| {
+                        let (expr, is_expr_alias) = match p {
+                            SelectItem::UnnamedExpr(e) => (e, false),
+                            SelectItem::ExprWithAlias { expr: e, .. } => (e, true),
+                            _ => return None,
+                        };
+                        if let Expr::Function(f) = expr {
+                            if is_agg(&f.name.to_string().to_uppercase()) {
+                                return eval_agg(f, rows);
+                            }
+                        }
+                        // Non-aggregate: resolve from GROUP BY key
+                        let name = match expr {
+                            Expr::Identifier(id) => id.value.clone(),
+                            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()).unwrap_or_default(),
+                            _ => return rows.first().map(|r| eval_row_expr(r, &combined_cols, expr).to_display()).flatten(),
+                        };
+                        let gpos = gb_col_indices.iter().enumerate().find(|(_, &ci)| {
+                            combined_cols[ci].name.eq_ignore_ascii_case(&name)
+                            || combined_cols[ci].name.rsplit('.').next().map_or(false, |n| n.eq_ignore_ascii_case(&name))
+                        }).map(|(p, _)| p);
+                        gpos.and_then(|p| group_key.get(p).and_then(|v| v.clone()))
+                            .or_else(|| rows.first().map(|r| eval_row_expr(r, &combined_cols, expr).to_display()).flatten())
+                    }).collect()
+                }).collect();
+                // ORDER BY on aggregated result
+                if let Some(ob) = &order_by {
+                    if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+                        for oe in exprs.iter().rev() {
+                            let col_name = oe.expr.to_string();
+                            if let Some(pidx) = out_cols.iter().position(|n| n.eq_ignore_ascii_case(&col_name)) {
+                                let asc = oe.options.asc.unwrap_or(true);
+                                out_rows.sort_by(|a, b| {
+                                    let av = a.get(pidx).and_then(|x| x.as_deref()).unwrap_or("");
+                                    let bv = b.get(pidx).and_then(|x| x.as_deref()).unwrap_or("");
+                                    let ord = match (av.parse::<i64>(), bv.parse::<i64>()) {
+                                        (Ok(xi), Ok(yi)) => xi.cmp(&yi),
+                                        _ => match (av.parse::<f64>(), bv.parse::<f64>()) {
+                                            (Ok(xf), Ok(yf)) => xf.partial_cmp(&yf).unwrap_or(std::cmp::Ordering::Equal),
+                                            _ => av.cmp(bv),
+                                        },
+                                    };
+                                    if asc { ord } else { ord.reverse() }
+                                });
+                            }
+                        }
+                    }
+                }
+                if let Some(lim) = &limit {
+                    if let Expr::Value(vs) = lim {
+                        if let sqlparser::ast::Value::Number(n, _) = &vs.value {
+                            if let Ok(n) = n.parse::<usize>() { out_rows.truncate(n); }
+                        }
+                    }
+                }
+                return QueryResult::rows(out_cols, out_rows);
+            }
+        }
+
         // Pre-projection sort: handle ORDER BY on columns not in SELECT list
         if let Some(ob) = &order_by {
             if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
@@ -1602,6 +1810,80 @@ impl Engine {
                 }
             }).collect();
             return QueryResult::rows(cols, vec![vals]);
+        }
+        // Handle derived table (subquery in FROM)
+        if let sqlparser::ast::TableFactor::Derived { subquery, .. } = &sel.from[0].relation {
+            let inner_qr = self.select(&db_name, *subquery.clone());
+            let (inner_col_names, inner_rows) = match inner_qr {
+                QueryResult::Rows { columns, rows } => (columns, rows),
+                QueryResult::ValueRows { columns, rows } => (columns, rows.into_iter().map(|r| r.into_iter().map(|v| v.to_display()).collect()).collect()),
+                other => return other,
+            };
+            let inner_cols: Vec<Column> = inner_col_names.iter().map(|n| Column {
+                name: n.clone(), col_type: ColumnType::VarChar(255), nullable: true, primary_key: false
+            }).collect();
+            let inner_value_rows: Vec<Row> = inner_rows.iter().map(|qrow| {
+                qrow.iter().map(|v| match v {
+                    Some(s) => if let Ok(n) = s.parse::<i64>() { Value::Int(n) }
+                               else if let Ok(f) = s.parse::<f64>() { Value::Float(f) }
+                               else { Value::Text(s.clone()) },
+                    None => Value::Null,
+                }).collect()
+            }).collect();
+            use sqlparser::ast::SelectItem;
+            let is_wc = sel.projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)));
+            let (out_names, out_exprs): (Vec<String>, Vec<Expr>) = if is_wc {
+                (inner_col_names.clone(), inner_cols.iter().map(|c| Expr::Identifier(sqlparser::ast::Ident::new(c.name.clone()))).collect())
+            } else {
+                sel.projection.iter().map(|p| match p {
+                    SelectItem::UnnamedExpr(e) => {
+                        let name = match e { Expr::Identifier(id) => id.value.clone(), Expr::CompoundIdentifier(ps) => ps.last().map(|i| i.value.clone()).unwrap_or_else(|| e.to_string()), _ => e.to_string() };
+                        (name, e.clone())
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => (alias.value.clone(), expr.clone()),
+                    _ => ("?".to_owned(), Expr::Identifier(sqlparser::ast::Ident::new("__null__"))),
+                }).unzip()
+            };
+            let mut result_rows: Vec<Vec<Option<String>>> = inner_value_rows.iter()
+                .filter(|r| sel.selection.as_ref().map_or(true, |w| eval_where(r, &inner_cols, w)))
+                .map(|row| out_exprs.iter().map(|e| eval_row_expr(row, &inner_cols, e).to_display()).collect())
+                .collect();
+            if let Some(ob) = &query.order_by {
+                if let sqlparser::ast::OrderByKind::Expressions(exprs) = &ob.kind {
+                    for oe in exprs.iter().rev() {
+                        let col_name = oe.expr.to_string();
+                        if let Some(pidx) = out_names.iter().position(|n| n.eq_ignore_ascii_case(&col_name)) {
+                            let asc = oe.options.asc.unwrap_or(true);
+                            result_rows.sort_by(|a, b| {
+                                let av = a.get(pidx).and_then(|x| x.as_deref()).unwrap_or("");
+                                let bv = b.get(pidx).and_then(|x| x.as_deref()).unwrap_or("");
+                                let ord = match (av.parse::<i64>(), bv.parse::<i64>()) {
+                                    (Ok(xi), Ok(yi)) => xi.cmp(&yi),
+                                    _ => match (av.parse::<f64>(), bv.parse::<f64>()) {
+                                        (Ok(xf), Ok(yf)) => xf.partial_cmp(&yf).unwrap_or(std::cmp::Ordering::Equal),
+                                        _ => av.cmp(bv),
+                                    },
+                                };
+                                if asc { ord } else { ord.reverse() }
+                            });
+                        }
+                    }
+                }
+            }
+            let offset_n = query.offset.as_ref().and_then(|o| {
+                if let Expr::Value(vs) = &o.value {
+                    if let sqlparser::ast::Value::Number(n, _) = &vs.value { n.parse::<usize>().ok() } else { None }
+                } else { None }
+            }).unwrap_or(0);
+            if offset_n > 0 { result_rows = result_rows.into_iter().skip(offset_n).collect(); }
+            if let Some(lim) = &query.limit {
+                if let Expr::Value(vs) = lim {
+                    if let sqlparser::ast::Value::Number(n, _) = &vs.value {
+                        if let Ok(n) = n.parse::<usize>() { result_rows.truncate(n); }
+                    }
+                }
+            }
+            return QueryResult::rows(out_names, result_rows);
         }
         let raw_table = sel.from[0].relation.to_string();
         let (sel_db, table_name) = if let Some(dot) = raw_table.find('.') {
@@ -2277,7 +2559,7 @@ impl Engine {
                     for asgn in &assignments {
                         let col_name = asgn.target.to_string();
                         if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
-                            let new_val = expr_to_value(asgn.value.clone());
+                            let new_val = eval_row_expr(row, &table.columns, &asgn.value);
                             // Keep col_int_data in sync
                             if let (Some(ref mut store), Value::Int(n)) = (table.col_int_data.get_mut(idx).and_then(|x| x.as_mut()), &new_val) {
                                 if ri < store.len() { store[ri] = *n; }
@@ -2298,7 +2580,8 @@ impl Engine {
                     for asgn in &assignments {
                         let col_name = asgn.target.to_string();
                         if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
-                            row[idx] = expr_to_value(asgn.value.clone());
+                            let nv = eval_row_expr(row, &table.columns, &asgn.value);
+                            row[idx] = nv;
                         }
                     }
                     affected += 1;
@@ -4261,7 +4544,7 @@ impl Engine {
                 for asgn in &assignments {
                     let col_name = asgn.target.to_string();
                     if let Some(idx) = table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(&col_name)) {
-                        row[idx] = expr_to_value(asgn.value.clone());
+                        row[idx] = eval_row_expr(row, &table.columns, &asgn.value);
                     }
                 }
                 affected += 1;
