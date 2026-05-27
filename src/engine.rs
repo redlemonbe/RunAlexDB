@@ -484,7 +484,8 @@ impl Engine {
             }
             Statement::Insert(insert) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
-                self.insert(db_name, &insert.table.to_string(), insert.source, insert.replace_into)
+                let col_names: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
+                self.insert(db_name, &insert.table.to_string(), insert.source, insert.replace_into, col_names)
             }
             Statement::Query(q) => {
                 let db_name = current_db.as_deref().unwrap_or("test");
@@ -924,6 +925,7 @@ impl Engine {
         table_name: &str,
         source: Option<Box<Query>>,
         replace_into: bool,
+        insert_columns: Vec<String>,
     ) -> QueryResult {
         let Some(source) = source else {
             return QueryResult::err(1064, "INSERT without VALUES");
@@ -1000,9 +1002,34 @@ impl Engine {
             return QueryResult::err(1146, &format!("Table '{db_name}.{table_name}' doesn't exist"));
         };
 
+        // Build column position map for named INSERT (col_map[table_col_idx] = Some(src_val_idx))
+        let col_map: Vec<Option<usize>> = if !insert_columns.is_empty() {
+            table.columns.iter().map(|tc| {
+                insert_columns.iter().position(|cn| cn.eq_ignore_ascii_case(&tc.name))
+            }).collect()
+        } else {
+            vec![]
+        };
+
         let count = source_rows.len() as u64;
-        for row in source_rows {
-            let row: Row = row;
+        for src_row in source_rows {
+            // Remap per-row so AUTO_INCREMENT is correct for each row
+            let row: Row = if !col_map.is_empty() {
+                col_map.iter().enumerate().map(|(tci, src_pos_opt)| {
+                    match src_pos_opt {
+                        Some(si) => src_row.get(*si).cloned().unwrap_or(Value::Null),
+                        None if table.columns[tci].primary_key => {
+                            let auto_val = table.next_auto;
+                            table.next_auto += 1;
+                            Value::Int(auto_val)
+                        }
+                        None => Value::Null,
+                    }
+                }).collect()
+            } else {
+                src_row
+            };
+
             // REPLACE INTO: remove existing row with same PK before inserting
             if replace_into {
                 if let Some(pk_idx) = table.pk_col_idx {
@@ -1024,10 +1051,14 @@ impl Engine {
                     }
                 }
             }
-            // Maintain PK index
+            // Maintain PK index + AUTO_INCREMENT counter
             if let Some(pk_idx) = table.pk_col_idx {
                 let pk_key = row_pk_key(&row, pk_idx);
                 table.pk_index.insert(pk_key, table.rows.len());
+                // Advance next_auto past inserted value
+                if let Some(Value::Int(n)) = row.get(pk_idx) {
+                    if *n >= table.next_auto { table.next_auto = n + 1; }
+                }
             }
             // Maintain column-oriented int store (for AVX2 scans)
             for (ci, store) in table.col_int_data.iter_mut().enumerate() {
