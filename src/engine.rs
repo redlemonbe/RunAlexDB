@@ -206,6 +206,27 @@ impl Engine {
 
     /// Increment write generation counter (called after any INSERT/UPDATE/DELETE).
     #[inline(always)]
+    pub fn take_snapshot(&self) -> std::collections::HashMap<String, std::collections::HashMap<String, Table>> {
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        let mut snap = std::collections::HashMap::new();
+        for (db_name, db_arc) in dbs.iter() {
+            let db = db_arc.read().unwrap_or_else(|e| e.into_inner());
+            snap.insert(db_name.clone(), db.tables.clone());
+        }
+        snap
+    }
+
+    pub fn restore_snapshot(&self, snap: std::collections::HashMap<String, std::collections::HashMap<String, Table>>) {
+        let dbs = self.databases.read().unwrap_or_else(|e| e.into_inner());
+        for (db_name, tables) in snap {
+            if let Some(db_arc) = dbs.get(&db_name) {
+                let mut db = db_arc.write().unwrap_or_else(|e| e.into_inner());
+                db.tables = tables;
+            }
+        }
+        self.bump_write_gen();
+    }
+
     pub fn bump_write_gen(&self) {
         self.write_gen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
@@ -806,6 +827,54 @@ impl Engine {
         }
     }
 
+
+    fn resolve_in_subqueries(&self, db_name: &str, expr: Expr) -> Expr {
+        match expr {
+            Expr::InSubquery { expr: inner, subquery, negated } => {
+                let result = self.select(db_name, *subquery);
+                let list: Vec<Expr> = match result {
+                    QueryResult::Rows { rows, .. } => rows.into_iter()
+                        .filter_map(|r| r.into_iter().next().flatten())
+                        .map(|s| Expr::Value(sqlparser::ast::ValueWithSpan {
+                            value: if s.parse::<i64>().is_ok() {
+                                sqlparser::ast::Value::Number(s, false)
+                            } else {
+                                sqlparser::ast::Value::SingleQuotedString(s)
+                            },
+                            span: sqlparser::tokenizer::Span { start: sqlparser::tokenizer::Location { line: 0, column: 0 }, end: sqlparser::tokenizer::Location { line: 0, column: 0 } },
+                        }))
+                        .collect(),
+                    QueryResult::ValueRows { rows, .. } => rows.into_iter()
+                        .filter_map(|r| r.into_iter().next())
+                        .map(|v| Expr::Value(sqlparser::ast::ValueWithSpan {
+                            value: match v {
+                                Value::Int(n) => sqlparser::ast::Value::Number(n.to_string(), false),
+                                Value::Text(s) => sqlparser::ast::Value::SingleQuotedString(s),
+                                Value::Float(f) => sqlparser::ast::Value::Number(f.to_string(), false),
+                                Value::Null => sqlparser::ast::Value::Null,
+                                Value::Bytes(_) => sqlparser::ast::Value::Null,
+                            },
+                            span: sqlparser::tokenizer::Span { start: sqlparser::tokenizer::Location { line: 0, column: 0 }, end: sqlparser::tokenizer::Location { line: 0, column: 0 } },
+                        }))
+                        .collect(),
+                    _ => vec![],
+                };
+                Expr::InList { expr: inner, list, negated }
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(self.resolve_in_subqueries(db_name, *left)),
+                op,
+                right: Box::new(self.resolve_in_subqueries(db_name, *right)),
+            },
+            Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+                op,
+                expr: Box::new(self.resolve_in_subqueries(db_name, *expr)),
+            },
+            Expr::Nested(e) => Expr::Nested(Box::new(self.resolve_in_subqueries(db_name, *e))),
+            other => other,
+        }
+    }
+
     fn insert(
         &self,
         db_name: &str,
@@ -1221,6 +1290,10 @@ impl Engine {
             (db_name.to_owned(), raw_table.trim_matches('`').to_owned())
         };
         let db_name = sel_db;
+        let mut sel = sel;
+        if let Some(w) = sel.selection.take() {
+            sel.selection = Some(self.resolve_in_subqueries(&db_name, w));
+        }
         if !sel.from[0].joins.is_empty() {
             return self.select_joined(db_name, sel, query.order_by, query.limit, query.offset);
         }

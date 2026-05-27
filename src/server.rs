@@ -213,6 +213,7 @@ where
 {
     // ── Handshake loop ──
     let mut current_db: Option<String> = None;
+        let mut txn_snapshot: Option<std::collections::HashMap<String, std::collections::HashMap<String, crate::engine::Table>>> = None;
     let mut stmt_cache: std::collections::HashMap<u32, PreparedStmt> = std::collections::HashMap::new();
     let mut next_stmt_id: u32 = 1;
     let mut effective_user = String::from("root");
@@ -338,6 +339,27 @@ where
                     }
                     // L0 result cache: CRC32 hash query, check write_gen for staleness.
                     // Hit: return pre-serialized bytes — zero SQL parsing, zero encoding.
+                    // Transaction control: handle in server, not engine
+                    {
+                        let sql_tc = sql.trim().trim_end_matches(';').to_uppercase();
+                        if sql_tc == "BEGIN" || sql_tc == "START TRANSACTION" {
+                            txn_snapshot = Some(db.take_snapshot());
+                            stream.write_all(&encode_packet(&ok_packet(0, 0), 1)).await?;
+                            continue;
+                        }
+                        if sql_tc == "COMMIT" {
+                            txn_snapshot = None;
+                            stream.write_all(&encode_packet(&ok_packet(0, 0), 1)).await?;
+                            continue;
+                        }
+                        if sql_tc == "ROLLBACK" {
+                            if let Some(snap) = txn_snapshot.take() {
+                                db.restore_snapshot(snap);
+                            }
+                            stream.write_all(&encode_packet(&ok_packet(0, 0), 1)).await?;
+                            continue;
+                        }
+                    }
                     let qhash = crate::simd_scan::hash_query(sql.as_bytes());
                     let cur_gen = db.write_gen();
                     if qhash == l0_hash && cur_gen == l0_gen {
